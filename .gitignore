@@ -1,0 +1,16 @@
+# 运行时用户数据（计时、提醒、快捷工具等本地记录）
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 调试 / QA 临时产物
+assets/raw/_debug_*.png
+assets/raw/_qa_*.png
+
+# IDE / 系统
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
