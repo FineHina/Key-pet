@@ -1,0 +1,21 @@
+{
+  "x": 1612,
+  "y": 661,
+  "scale": 0.42,
+  "voice_enabled": true,
+  "voice_volume": 35,
+  "mute": false,
+  "dark_angry_voice": false,
+  "hover_voice": false,
+  "idle_voice": false,
+  "assistant_open_voice": true,
+  "birthday_mmdd": "",
+  "calendar_events_enabled": true,
+  "dnd": false,
+  "quiet_hours_enabled": false,
+  "quiet_start": "23:00",
+  "quiet_end": "08:00",
+  "fullscreen_dnd": false,
+  "focus_minutes": 25,
+  "break_minutes": 5
+}

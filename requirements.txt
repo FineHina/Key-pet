@@ -1,0 +1,6 @@
+PySide6>=6.6
+pillow
+numpy
+imageio
+imageio-ffmpeg
+# Asset preparation tools additionally need: scipy
