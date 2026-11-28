@@ -1,16 +1,20 @@
 """Application-owned timer, local services, notification policy and audio routing."""
+from datetime import datetime
 from pathlib import Path
+from sqlite3 import Error as DatabaseError
 import time
 from uuid import uuid4
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 
 from . import config
 from .audio import AudioService
-from .calendar_events import CalendarEvents
+from .calendar_events import CalendarEvents, STARTUP_VOICES
 from .dialogue import DialogueService, TOPICS
 from .shortcuts import ShortcutsService
 from .focus import FocusService
+from .interaction import GIFTS, InteractionService
+from .interaction_feedback import CUES, Cue, milestone
 from .notification_policy import NotificationPolicy
 from .reminders import ReminderService
 from .storage import Storage
@@ -21,6 +25,8 @@ ROOT = Path(__file__).resolve().parents[1]
 class AssistantController(QObject):
     changed = Signal()
     shortcuts_changed = Signal()
+    interaction_changed = Signal()
+    interaction_voice = Signal(str)
 
     def __init__(self, pet, database=None, parent=None, wall_clock=time.time,
                  mono_clock=time.monotonic, start_timer=True):
@@ -30,14 +36,21 @@ class AssistantController(QObject):
         self.wall_clock = wall_clock
         self.mono_clock = mono_clock
         self.storage = Storage(database if database is not None else ROOT / "data/assistant.sqlite3")
+        self.interaction = InteractionService(self.storage, wall_clock=wall_clock)
+        self.interaction_window = None
+        self.interaction_error = None
         self.focus = FocusService(self.storage, wall_clock=wall_clock, mono_clock=mono_clock)
         self.reminders = ReminderService(self.storage, wall_clock=wall_clock)
         self.policy = NotificationPolicy(self.settings, wall_clock=wall_clock)
         self.audio = AudioService(self.policy, parent=self, clock=mono_clock)
+        self._interaction_voice_id = None
+        self._viewed_rewards = set()
+        self.audio.changed.connect(self._sync_interaction_subtitle)
         self.shortcuts = ShortcutsService(self.storage)
         self.dialogue = DialogueService(self.audio.library)
         self.calendar = CalendarEvents(self.storage, self.settings, wall_clock=wall_clock)
         self._calendar_ready_at = self.mono_clock() + 5
+        self._startup_greeted = False
         self.panel = None
         self.notification_window = None
         self._dnd = self.policy.is_dnd()
@@ -55,6 +68,7 @@ class AssistantController(QObject):
         from .notification_window import NotificationWindow
         self.panel = AssistantPanel(self)
         self.notification_window = NotificationWindow(self)
+        self.panel.theme_changed.connect(self.notification_window.set_theme)
         self.notification_window.open_requested.connect(self.open_panel)
 
     def open_panel(self, tab=None):
@@ -67,6 +81,8 @@ class AssistantController(QObject):
                 if self.panel.tabs.tabText(index) == tab:
                     self.panel.tabs.setCurrentIndex(index)
                     break
+        if self.panel.isMinimized():
+            self.panel.setWindowState(self.panel.windowState() & ~Qt.WindowMinimized)
         self.panel.show()
         self.panel.raise_()
         self.panel.activateWindow()
@@ -76,7 +92,19 @@ class AssistantController(QObject):
     def tick(self):
         if self._closed:
             return
-        notifications = self.focus.tick() + self.reminders.tick()
+        # Commit completion and its one-time affection credit together.
+        focus_milestone = None
+        with self.storage.transaction():
+            focus_notifications = self.focus.tick()
+            for item in focus_notifications:
+                if item["kind"] == "focus":
+                    earned = self.interaction.focus_completed(item["entity_id"])
+                    if earned:
+                        after = self.interaction.status()[0]
+                        focus_milestone = milestone(after - earned, after)
+        notifications = focus_notifications + self.reminders.tick()
+        if focus_notifications:
+            self.interaction_changed.emit()
         dnd = self.policy.is_dnd()
         if dnd != self._dnd:
             self._dnd = dnd
@@ -93,20 +121,50 @@ class AssistantController(QObject):
                 self.storage.mark_presented([item["id"] for item in notifications])
                 self.notification_window.show()
                 self._notify_completed(notifications)
+        if focus_milestone and not dnd:
+            # The existing completion notification owns audio and its caption.
+            self._apply_interaction_pose(CUES[focus_milestone[0]], self.mono_clock())
         self.pet.bubbles.tick(self.mono_clock())
         self._calendar_tick()
         self._idle_voice_tick()
         self.changed.emit()
 
+    def play_startup_greeting(self):
+        """Choose a single greeting after the desktop pet has become visible."""
+        if self._closed or self._startup_greeted:
+            return
+        self._startup_greeted = True
+        blocked = self._automatic_voice_blocked()
+        event = self.calendar.claim(blocked=blocked)
+        if blocked:
+            return
+        if event:
+            self._apply_interaction_pose(Cue("nod", event["category"], 0.9), self.mono_clock())
+            self._show_calendar(event, explicit=False, startup=True)
+            return
+        hour = datetime.fromtimestamp(self.wall_clock()).hour
+        if 5 <= hour < 12:
+            greeting = "早上好"
+        elif 12 <= hour < 18:
+            greeting = "下午好"
+        else:
+            greeting = "晚上好" if hour >= 18 else "你好"
+        self._apply_interaction_pose(Cue("nod", "smile", 0.9), self.mono_clock())
+        self._feature_reaction("greeting", "smile", f"{greeting}，欢迎回来。", explicit=False)
+
+    def _automatic_voice_blocked(self):
+        return bool(
+            not self.policy.can_voice() or not self.pet.isVisible()
+            or self.focus.snapshot() is not None or self.storage.pending()
+            or self.audio.current_id is not None or self.pet.bubbles.active is not None
+            or self.pet.state.get("pressed") or self.pet.state.get("dragging")
+            or self.pet.state.get("reaction") is not None
+        )
+
     def _calendar_tick(self):
         if self.mono_clock() < self._calendar_ready_at:
             return
-        blocked = (not self.policy.can_voice() or not self.pet.isVisible()
-                   or self.focus.snapshot() is not None or bool(self.storage.pending())
-                   or self.audio.current_id is not None or self.pet.bubbles.active is not None
-                   or self.pet.state.get("pressed") or self.pet.state.get("dragging")
-                   or self.pet.state.get("reaction") is not None)
-        event = self.calendar.claim(blocked=bool(blocked))
+        event = self.calendar.claim(blocked=self._automatic_voice_blocked())
         if event is not None:
             self._show_calendar(event, explicit=False)
 
@@ -142,7 +200,17 @@ class AssistantController(QObject):
         if priority and self.audio.current_reaction == self.pet.bubbles.active.get("id"):
             self._protected_reaction = self.pet.bubbles.active
 
-    def pointer_event(self, event):
+    def pointer_event(self, event, region=None):
+        crossed = None
+        if event == "click" and region == "head":
+            earned = self.interaction.touch()
+            if earned:
+                after = self.interaction.status()[0]
+                self.interaction_changed.emit()
+                crossed = milestone(after - earned, after)
+        elif event == "press" and self.pet.state.get("expression") in ("angry", "dark_angry"):
+            self.interaction.ask_for_quiet()
+            self.interaction_changed.emit()
         if (self._protected_reaction is not None
                 and self.audio.current_priority > 0
                 and self.mono_clock() < self.audio.current_until
@@ -157,6 +225,9 @@ class AssistantController(QObject):
         if event in ("hover",) and self.policy.is_dnd():
             self.pet.bubbles.clear()
             return
+        if crossed:
+            self._interaction_feedback(*crossed)
+            return
         active = self.pet.bubbles.active
         if active is not None and active is not self._last_reaction:
             if event == "hover" and not self.settings.get("hover_voice", False):
@@ -165,6 +236,141 @@ class AssistantController(QObject):
             scene = "drag" if event == "drag_start" else "click" if event == "click" else active["category"]
             self.audio.respond(active, scene, explicit=event != "hover")
             self._last_reaction = active
+
+    def grant_startup_gift(self):
+        try:
+            gift = self.interaction.grant_daily_gift()
+        except DatabaseError as error:
+            self.interaction_error = f"今日礼物暂未入库：{error}"
+            return None
+        if gift:
+            self.interaction_changed.emit()
+        return gift
+
+    def open_interaction(self, section="care"):
+        if self.interaction_window is None:
+            from .interaction_window import InteractionWindow
+            from .ui_theme import resolved_dark
+            self.interaction_window = InteractionWindow(self)
+            self.interaction_window.set_theme(resolved_dark(self.settings.get("assistant_theme", "system")))
+            if self.panel:
+                self.panel.theme_changed.connect(self.interaction_window.set_theme)
+            if self.interaction_error:
+                self.interaction_window.feedback.setText(self.interaction_error)
+        self.interaction_window.show_section(section)
+
+    def _sync_interaction_subtitle(self):
+        if self._interaction_voice_id and self.audio.current_reaction != self._interaction_voice_id:
+            self._interaction_voice_id = None
+            self.interaction_voice.emit("")
+
+    def _apply_interaction_pose(self, cue, now):
+        behaviors = getattr(self.pet, "behaviors", None)
+        return bool(behaviors and self.pet.isVisible() and behaviors.play_interaction_pose(
+            cue.pose, cue.expression, cue.seconds, now))
+
+    def _interaction_voice_entry(self, cue, now, replay):
+        library = self.audio.library
+        available = []
+        for voice_id in cue.voices:
+            entry = library.source(voice_id)
+            if entry and entry.get("text") and entry.get("grade") == "A":
+                available.append(entry)
+        for entry in available:
+            if entry["id"] not in library.recent:
+                return entry
+        last = library.recent[-1] if library.recent else None
+        for entry in available:
+            if entry["id"] != last:
+                return entry
+        if available and (replay or now - self.audio.last_started >= 8):
+            return available[0]
+        return None
+
+    def _interaction_feedback(self, event, text, *, previous_points=None, replay=False):
+        if self._closed or self.policy.is_dnd():
+            return False
+        if previous_points is not None:
+            crossed = milestone(previous_points, self.interaction.status()[0])
+            if crossed:
+                event, caption = crossed
+                text = f"{text} · {caption}"
+        cue = CUES[event]
+        now = self.mono_clock()
+        busy = self.audio.current_id is not None and now < self.audio.current_until
+        if ((busy and self.audio.current_priority > 0)
+                or (self.notification_window and self.notification_window.isVisible())):
+            return False
+        animated = self._apply_interaction_pose(cue, now)
+        if busy:
+            return False
+
+        entry = self._interaction_voice_entry(cue, now, replay) if self.policy.can_voice() else None
+        reaction_id = uuid4().hex
+        played = bool(entry and self.audio.play(entry, reaction_id, f"interaction_{event}"))
+        if animated:
+            self.pet.bubbles.show(cue.expression, now, 5.0)
+            active = self.pet.bubbles.active
+            active.update(id=reaction_id, context_text=text, text=text)
+            if played:
+                active.update(text=f"{text}\n{entry['text']}", voice_id=entry["id"],
+                              dur=max(5.0, float(entry["duration"]) + 0.5))
+            self._last_reaction = active
+        if played:
+            self._interaction_voice_id = reaction_id
+            self.interaction_voice.emit(entry["text"])
+        return played
+
+    def care_for_key(self, action):
+        result = self.interaction.care(action)
+        self.interaction_changed.emit()
+        points = self.interaction.status()[0]
+        self._interaction_feedback("rest" if action == "rest" else "food", result[0],
+                                   previous_points=points - result[1])
+        return result
+
+    def give_kei_gift(self, gift_id):
+        result = self.interaction.give(gift_id)
+        self.interaction_changed.emit()
+        points = self.interaction.status()[0]
+        self._interaction_feedback("gift", result[0], previous_points=points - result[1])
+        return result
+
+    def replay_interaction_milestone(self):
+        if self.interaction.status()[0] < 70:
+            return False
+        return self._interaction_feedback("bonded_replay", "默契纪念语音", replay=True)
+
+    def view_interaction_reward(self, pack=None):
+        if pack is None:
+            gift = self.interaction.today_gift()
+            if gift is None:
+                return
+            day = datetime.fromtimestamp(self.wall_clock()).date()
+            pack = f"daily:{day.isoformat()}"
+            text = f"今日礼物 · {GIFTS[gift].name}"
+        else:
+            if not self.interaction.reward_cards(pack):
+                return
+            text = "这一场的礼物牌"
+        if pack not in self._viewed_rewards:
+            self._viewed_rewards.add(pack)
+            self._interaction_feedback("reward", text)
+
+    def finish_interaction_game(self, kind, match_id, *, outcome=None, summary="游戏完成"):
+        pack, points, created = self.interaction.settle_game(kind, match_id)
+        if created:
+            self.interaction_changed.emit()
+            result_cue = outcome if kind == "rps" and outcome in ("player_win", "kei_win") else (
+                "draw" if kind == "rps" else kind)
+            total = self.interaction.status()[0]
+            self._interaction_feedback(result_cue, summary, previous_points=total - points)
+        return pack, points
+
+    def reveal_gift(self, pack, slot):
+        result = self.interaction.reveal(pack, slot)
+        self.interaction_changed.emit()
+        return result
 
     def focus_snapshot(self):
         return self.focus.snapshot()
@@ -196,15 +402,19 @@ class AssistantController(QObject):
     def reminders_list(self):
         return self.reminders.list_all()
 
-    def add_reminder(self, title, due_at):
-        result = self.reminders.add(title, due_at)
+    def add_reminder(self, title, due_at, time_mode="absolute"):
+        result = self.reminders.add(title, due_at, time_mode)
         self.changed.emit()
         return result
 
-    def edit_reminder(self, reminder_id, title, due_at):
-        result = self.reminders.edit(reminder_id, title, due_at)
+    def edit_reminder(self, reminder_id, title, due_at=None, *, time_mode=None, rearm=False):
+        result = self.reminders.edit(reminder_id, title, due_at, time_mode=time_mode, rearm=rearm)
         self.changed.emit()
         return result
+
+    def delete_reminder(self, reminder_id):
+        self.reminders.delete(reminder_id)
+        self.changed.emit()
 
     def cancel_reminder(self, reminder_id):
         self.reminders.cancel(reminder_id)
@@ -278,10 +488,15 @@ class AssistantController(QObject):
     def today_event(self):
         return self.calendar.today()
 
-    def _show_calendar(self, event, explicit=True):
-        entry = self.audio.library.choose(event["topic"], self.settings, manual=True)
-        if entry and entry.get("grade") not in ("A", "B"):
-            entry = None
+    def _show_calendar(self, event, explicit=True, startup=False):
+        library = self.audio.library
+        entry = library.source(STARTUP_VOICES[event["event_key"]]) if startup else None
+        if not entry or not entry.get("text") or entry.get("grade") not in ("A", "B"):
+            entry = library.choose(event["topic"], self.settings, manual=True)
+            if entry and entry.get("grade") not in ("A", "B"):
+                entry = None
+        if startup and entry is None:
+            entry = library.choose("greeting", self.settings)
         text = event["text"] + ("\n" + entry["text"] if entry else "")
         return self._show_dialogue_reply({"text": text, "category": event["category"],
                                          "voice": entry, "topic": event["topic"]}, explicit=explicit)
@@ -317,6 +532,9 @@ class AssistantController(QObject):
         self.shortcuts_changed.emit()
         self.changed.emit()
 
+    def check_shortcut(self, shortcut_id):
+        return self.shortcuts.check(shortcut_id)
+
     def open_shortcut(self, shortcut_id):
         result = self.shortcuts.open(shortcut_id)
         self._feature_reaction("shortcut_open", "default", f"已发起打开：{result['name']}")
@@ -331,7 +549,7 @@ class AssistantController(QObject):
     def tray_status(self):
         pending = len(self.storage.pending())
         focus = self.focus.snapshot()
-        parts = ["凯伊 · 桌宠助手"]
+        parts = ["KEI Assistant"]
         if focus and focus["state"] in ("running", "paused"):
             seconds = max(0, round(focus["remaining"]))
             parts.append(f"{'休息' if focus['kind'] == 'break' else '专注'} {seconds // 60:02d}:{seconds % 60:02d}")
@@ -347,6 +565,8 @@ class AssistantController(QObject):
         self._closed = True
         self.timer.stop()
         self.audio.shutdown()
+        if self.interaction_window:
+            self.interaction_window.close()
         if self.panel:
             self.panel.hide()
         if self.notification_window:

@@ -9,6 +9,12 @@ EVENTS = {
     "birthday": {"name": "生日彩蛋", "topic": "season_birthday", "category": "happy", "text": "生日快乐！"},
 }
 DATES = {"01-01": "newyear", "10-31": "halloween", "12-25": "xmas"}
+STARTUP_VOICES = {
+    "newyear": "ch0335_season_newyear_1",
+    "halloween": "ch0335_season_halloween_1",
+    "xmas": "ch0335_season_xmas_1",
+    "birthday": "ch0335_season_birthday_player_7",
+}
 
 
 class CalendarEvents:

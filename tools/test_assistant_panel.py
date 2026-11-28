@@ -11,6 +11,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from PySide6.QtCore import QDateTime, QObject, Qt, QTime, Signal
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QDateTimeEdit, QDialog, QDialogButtonBox, QLineEdit
 
 from pet.assistant_panel import AssistantPanel
@@ -75,12 +76,12 @@ class FakeController(QObject):
     def reminders_list(self):
         return self.reminders
 
-    def add_reminder(self, title, due_at):
+    def add_reminder(self, title, due_at, time_mode="absolute"):
         self._record("add_reminder", title, due_at)
         self.reminders.append({"id": "r-new", "title": title, "due_at": due_at, "status": "scheduled"})
         self.changed.emit()
 
-    def edit_reminder(self, identifier, title, due_at):
+    def edit_reminder(self, identifier, title, due_at, *, time_mode=None, rearm=False):
         self._record("edit_reminder", identifier, title, due_at)
         for item in self.reminders:
             if item["id"] == identifier:
@@ -144,13 +145,20 @@ class AssistantPanelTests(unittest.TestCase):
             self.assertEqual((spin.minimum(), spin.maximum()), (1, 1440))
 
     def test_all_focus_presets_and_custom_durations(self):
-        for button, minutes, kind in zip(self.panel.start_buttons, (25, 45, 60, 25, 5, 10, 5),
-                                         ("focus", "focus", "focus", "focus", "break", "break", "break")):
-            button.click()
-            self.assertIn(("start_focus", minutes, kind), self.controller.calls)
-            self.panel.cancel_focus_button.click()
+        for index, (kind, presets) in enumerate((("focus", (25, 45, 60)), ("break", (5, 10)))):
+            self.panel.focus_mode_buttons.button(index).click()
+            for minutes in presets:
+                before = list(self.controller.calls)
+                self.panel.presets[kind].button(minutes).click()
+                self.assertEqual(self.controller.calls, before)
+                self.assertEqual(self.panel.countdown.text(), f"{minutes:02d}:00")
+                self.panel.start_buttons[index].click()
+                self.assertIn(("start_focus", minutes, kind), self.controller.calls)
+                self.panel.cancel_focus_button.click()
+        self.panel.focus_mode_buttons.button(0).click()
+        self.panel.presets["focus"].button(0).click()
         self.panel.focus_minutes.setValue(1440)
-        self.panel.start_buttons[3].click()
+        self.panel.start_buttons[0].click()
         self.assertIn(("start_focus", 1440, "focus"), self.controller.calls)
 
     def test_focus_state_and_countdown_follow_changed(self):
@@ -167,7 +175,7 @@ class AssistantPanelTests(unittest.TestCase):
         self.controller.changed.emit()
         self.assertEqual(self.panel.countdown.text(), "01:02")
         self.panel.cancel_focus_button.click()
-        self.assertEqual(self.panel.countdown.text(), "00:00")
+        self.assertEqual(self.panel.countdown.text(), "25:00")
         self.assertTrue(self.panel.start_buttons[0].isEnabled())
 
     def test_completed_and_cancelled_snapshots_disable_controls(self):
@@ -222,6 +230,30 @@ class AssistantPanelTests(unittest.TestCase):
         self.panel.add_reminder_button.click()
         self.assertIn(("add_reminder", "会议", target.toMSecsSinceEpoch() / 1000), self.controller.calls)
 
+    def test_new_reminder_button_opens_form_and_closes_it_after_save(self):
+        self.panel.tabs.setCurrentIndex(1)
+        self.panel.show()
+        APP.processEvents()
+        self.assertFalse(self.panel.reminder_title.isVisible())
+        self.assertFalse(self.panel.pending_table.isVisible())
+
+        QTest.mouseClick(self.panel.new_reminder, Qt.LeftButton)
+        APP.processEvents()
+        self.assertTrue(self.panel.reminder_title.isVisible())
+        self.assertTrue(self.panel.reminder_title.hasFocus())
+        self.assertFalse(self.panel.pending_table.isVisible())
+        self.panel.reminder_title.setText("补水")
+
+        QTest.mouseClick(self.panel.new_reminder, Qt.LeftButton)
+        self.assertFalse(self.panel.reminder_title.isVisible())
+        QTest.mouseClick(self.panel.new_reminder, Qt.LeftButton)
+        self.assertEqual(self.panel.reminder_title.text(), "补水")
+        QTest.keyClick(self.panel.reminder_title, Qt.Key_Return)
+        self.assertEqual([call[:2] for call in self.controller.calls], [("add_reminder", "补水")])
+        self.assertFalse(self.panel.new_reminder.isChecked())
+        self.assertFalse(self.panel.reminder_title.isVisible())
+        self.assertFalse(self.panel.pending_table.isVisible())
+
     def test_invalid_reminder_never_calls_controller(self):
         self.panel.add_reminder_button.click()
         self.assertEqual(self.controller.calls, [])
@@ -253,7 +285,8 @@ class AssistantPanelTests(unittest.TestCase):
         self.assertIn(("cancel_reminder", "r2"), self.controller.calls)
         self.assertFalse(self.panel.cancel_reminder_button.isEnabled())
         self.panel.reminders_table.selectRow(1)  # done after reversing
-        self.assertFalse(self.panel.edit_reminder_button.isEnabled())
+        self.assertTrue(self.panel.edit_reminder_button.isEnabled())
+        self.assertTrue(self.panel.delete_reminder_button.isEnabled())
         self.assertEqual(self.panel.reminders_table.item(1, 2).text(), "已完成")
 
     def test_edit_dialog_saves_selected_id_without_real_dialog(self):
@@ -318,13 +351,13 @@ class AssistantPanelTests(unittest.TestCase):
         self.panel.stop_button.click()
         self.assertIn(("audition", "happy_01"), self.controller.calls)
         self.assertIn(("stop_audio",), self.controller.calls)
-        self.panel.voice_combo.setCurrentIndex(1)
+        self.panel.voice_list.setCurrentRow(1)
         self.assertFalse(self.panel.audition_button.isEnabled())
         self.assertFalse(self.panel.stop_button.isEnabled())
         self.assertIn("缺失", self.panel.voice_text.toPlainText())
         self.controller.voices.reverse()
         self.controller.changed.emit()
-        self.assertEqual(self.panel.voice_combo.currentData(), "missing_02")
+        self.assertEqual(self.panel._selected_voice_id(), "missing_02")
 
     def test_catalog_filters_category_grade_and_chinese_search(self):
         self.controller.voices = [
@@ -334,16 +367,16 @@ class AssistantPanelTests(unittest.TestCase):
              "grade": "C", "available": True},
         ]
         self.controller.changed.emit()
-        self.assertEqual(self.panel.voice_combo.count(), 2)
+        self.assertEqual(self.panel.voice_list.count(), 2)
         self.panel.voice_grade.setCurrentText("C")
-        self.assertEqual(self.panel.voice_combo.currentData(), "two")
+        self.assertEqual(self.panel._selected_voice_id(), "two")
         self.panel.voice_grade.setCurrentText("全部等级")
         self.panel.voice_search.setText("老师")
-        self.assertEqual(self.panel.voice_combo.count(), 1)
-        self.assertEqual(self.panel.voice_combo.currentData(), "one")
+        self.assertEqual(self.panel.voice_list.count(), 1)
+        self.assertEqual(self.panel._selected_voice_id(), "one")
         self.panel.voice_search.clear()
         self.panel.voice_category.setCurrentIndex(self.panel.voice_category.findData("剧情"))
-        self.assertEqual(self.panel.voice_combo.currentData(), "two")
+        self.assertEqual(self.panel._selected_voice_id(), "two")
 
     def test_empty_voice_list_disables_controls(self):
         self.controller.voices = []
@@ -389,9 +422,9 @@ class NotificationWindowTests(unittest.TestCase):
         item.update(title="<b>提醒原文</b>", body="<img src='http://example.invalid/image'>")
         self.window.sync([item])
         self.assertEqual(self.window.title_label.textFormat(), Qt.PlainText)
-        self.assertEqual(self.window.body_label.textFormat(), Qt.PlainText)
+        self.assertFalse(self.window.body_text.acceptRichText())
         self.assertEqual(self.window.title_label.text(), item["title"])
-        self.assertEqual(self.window.body_label.text(), item["body"])
+        self.assertEqual(self.window.body_text.toPlainText(), item["body"])
 
     def test_sync_never_presents_and_empty_hides(self):
         self.window.sync([notification()])
@@ -408,7 +441,7 @@ class NotificationWindowTests(unittest.TestCase):
         self.window.sync([first, second])
         self.assertEqual(self.window.title_label.text(), first["title"])
         self.window.pending_list.setCurrentRow(1)
-        self.assertEqual(self.window.body_label.text(), second["body"])
+        self.assertEqual(self.window.body_text.toPlainText(), second["body"])
         self.window.sync([second, first, notification("n3")])
         self.assertEqual(id(self.window), identity)
         self.assertEqual(self.window.pending_list.count(), 3)

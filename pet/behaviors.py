@@ -46,7 +46,8 @@ class Behaviors:
         self.rng = random.Random() if rng is None else rng
         self.animation_clips = self._animation_metadata(animation_clips)
         self.idle_animations = tuple(
-            name for name, metadata in self.animation_clips.items() if metadata["idle"])
+            name for name, metadata in self.animation_clips.items()
+            if metadata["idle"])
         self.idle_animation_names = self.idle_animations
         self.previewing = False
         self.animation_previewing = False
@@ -172,6 +173,22 @@ class Behaviors:
         self._expression(category, now + MOOD_DURATION)
         if speak:
             self.bubbles.show(category, now, 5.0)
+
+    def play_interaction_pose(self, kind, category, duration, now=None):
+        """Apply a one-shot procedural pose without interrupting drag or authored clips."""
+        now = self._now(now)
+        self._expire(now)
+        if (self.state["pressed"] or self.state["dragging"] or self.state["animation"]
+                or self.previewing):
+            return False
+        self._cancel_idle()
+        self._cancel_motion()
+        self._expression(category, now + duration)
+        self.state["reaction"] = {"kind": kind, "t0": now, "dur": duration}
+        if kind == "hop":
+            self.state["hop_t0"] = now
+        self.next_idle = now + self.rng.uniform(20.0, 45.0)
+        return True
 
     def on_press(self, region="body", now=None):
         if region not in REGIONS:

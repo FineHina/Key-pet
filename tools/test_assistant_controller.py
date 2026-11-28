@@ -1,6 +1,7 @@
 """Controller integration and original voice pairing with local temporary data."""
 import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from datetime import datetime
 import json
 from pathlib import Path
 import sys
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from pet import config
 from pet.assistant import AssistantController
 from pet.audio import VoiceLibrary
+from pet.interaction_feedback import CUES
 from pet.window import PetWindow
 
 APP = QApplication.instance() or QApplication([])
@@ -109,6 +111,94 @@ class ControllerTests(unittest.TestCase):
         self.assertIsNone(self.controller.audio.current_id)
         self.assertEqual(self.pet.bubbles.active["dur"], 5)
 
+    def test_interaction_voices_resolve_and_food_pairs_same_subtitle_and_pose(self):
+        library = self.controller.audio.library
+        for cue in CUES.values():
+            for voice_id in cue.voices:
+                entry = library.source(voice_id)
+                self.assertTrue(entry and entry["text"], voice_id)
+                self.assertEqual(entry["grade"], "A")
+        self.pet.show()
+        self.pet._frame.stop()
+        self.controller.settings.update(mute=False, dnd=False, fullscreen_dnd=False)
+        with patch.object(self.controller.audio, "play", return_value=True) as play:
+            self.controller.care_for_key("milk_tea_hot")
+        entry, identifier, scene = play.call_args.args
+        self.assertEqual((entry["id"], scene), ("ch0335_cafe_monolog_2", "interaction_food"))
+        self.assertEqual(self.pet.state["reaction"]["kind"], "curious")
+        card = self.pet.bubbles.active
+        self.assertEqual(card["id"], identifier)
+        self.assertIn("热奶茶", card["text"])
+        self.assertIn(entry["text"], card["text"])
+
+    def test_ordinary_gift_plays_the_original_gesture_and_returns_to_idle(self):
+        scene = self.pet.scene
+        self.pet.show()
+        self.pet._frame.stop()
+        self.pet._hit.stop()
+        gift = self.controller.grant_startup_gift()
+        self.controller.give_kei_gift(gift)
+
+        reaction = self.pet.state["reaction"]
+        self.assertEqual(reaction["kind"], "receive")
+        halfway = self.clock.value + reaction["dur"] / 2
+        holding = scene.sample(halfway, self.pet.state, 1)
+        idle = scene.sample(halfway, {}, 1)
+        self.assertEqual(len(holding.layers), len(idle.layers))
+        self.assertNotEqual(holding.layers[-1].transform, idle.layers[-1].transform)
+        after = self.clock.value + reaction["dur"] + .2
+        self.pet.behaviors.tick(after)
+        self.assertIsNone(self.pet.state["reaction"])
+        recovered = scene.sample(after, self.pet.state, 1)
+        self.assertEqual(len(recovered.layers), len(idle.layers))
+        self.assertEqual([layer.transform for layer in recovered.layers],
+                         [layer.transform for layer in scene.sample(after, {}, 1).layers])
+        self.assertEqual(self.controller.interaction.inventory()[gift], (0, 1))
+
+    def test_affection_milestone_replaces_ordinary_gift_voice(self):
+        self.controller.settings.update(mute=False, dnd=False, fullscreen_dnd=False)
+        gift = self.controller.grant_startup_gift()
+        self.controller.storage.conn.execute("UPDATE companion_state SET affection = 69 WHERE id = 1")
+        with patch.object(self.controller.audio, "play", return_value=True) as play:
+            self.controller.give_kei_gift(gift)
+        play.assert_called_once()
+        self.assertEqual(play.call_args.args[0]["id"], "ch0335_battle_buffed_1")
+        self.assertEqual(self.controller.interaction.inventory()[gift], (0, 1))
+        self.assertEqual(self.controller.interaction.status()[0], 71)
+
+    def test_game_result_and_reward_view_each_play_at_most_once(self):
+        self.controller.settings.update(mute=False, dnd=False, fullscreen_dnd=False)
+        with patch.object(self.controller.audio, "play", return_value=True) as play:
+            pack, _ = self.controller.finish_interaction_game("rps", "win", outcome="kei_win")
+            self.controller.finish_interaction_game("rps", "win", outcome="kei_win")
+            self.controller.finish_interaction_game("rps", "draw", outcome="draw")
+            self.controller.view_interaction_reward(pack)
+            self.controller.view_interaction_reward(pack)
+            self.controller.reveal_gift(pack, 0)
+        self.assertEqual([call.args[0]["id"] for call in play.call_args_list],
+                         ["ch0335_battle_victory_1", "ch0335_eventmission_get_1_1"])
+
+    def test_interaction_respects_muting_dnd_and_does_not_replace_priority_card(self):
+        self.pet.show()
+        self.pet._frame.stop()
+        self.controller.settings.update(mute=True, dnd=False, fullscreen_dnd=False)
+        with patch.object(self.controller.audio, "play") as play:
+            self.controller.care_for_key("rest")
+            self.assertEqual(self.pet.state["reaction"]["kind"], "relax")
+            self.controller.settings["dnd"] = True
+            self.controller.care_for_key("cake")
+            self.assertEqual(self.pet.state["reaction"]["kind"], "relax")
+            self.controller.settings.update(mute=False, dnd=False)
+            self.controller.audio.current_id = "priority"
+            self.controller.audio.current_until = self.clock.value + 10
+            self.controller.audio.current_priority = 1
+            self.pet.bubbles.show("smile", self.clock.value)
+            notice = self.pet.bubbles.active
+            self.controller.care_for_key("milk_tea_cold")
+            self.assertIs(self.pet.bubbles.active, notice)
+            self.assertEqual(self.pet.state["reaction"]["kind"], "relax")
+            play.assert_not_called()
+
     def test_settings_preserve_geometry_and_dnd_stops_current_audio(self):
         config.save({"x": 123, "y": 456, "scale": .42})
         self.controller.update_settings({"voice_volume": 20, "dnd": True})
@@ -170,7 +260,6 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(reply["text"], self.pet.bubbles.active["text"])
 
     def test_calendar_dnd_skip_persists_after_disable_and_restart(self):
-        from datetime import datetime
         self.clock.value = datetime(2026, 12, 25, 12).timestamp()
         self.controller.settings.update(dnd=True, mute=False)
         self.controller._calendar_ready_at = 0
@@ -181,6 +270,62 @@ class ControllerTests(unittest.TestCase):
         with patch.object(self.controller, "_show_calendar") as show:
             self.controller.tick()
             show.assert_not_called()
+
+    def test_startup_greeting_runs_once_and_uses_original_greeting_pool(self):
+        self.clock.value = datetime(2026, 11, 27, 9).timestamp()
+        self.controller.settings.update(mute=False, dnd=False, fullscreen_dnd=False)
+        self.pet.show()
+        with patch.object(self.controller.audio, "play", return_value=True) as play:
+            self.controller.play_startup_greeting()
+            self.controller.play_startup_greeting()
+        play.assert_called_once()
+        voice, reaction_id, scene = play.call_args.args
+        self.assertEqual(scene, "greeting")
+        self.assertIn(voice["id"], self.controller.audio.library.scenes["greeting"]["sources"])
+        self.assertIn("早上好", self.pet.bubbles.active["text"])
+        self.assertIn(voice["text"], self.pet.bubbles.active["text"])
+        self.assertEqual(self.pet.bubbles.active["id"], reaction_id)
+
+    def test_startup_uses_the_right_date_voice_then_falls_back_on_same_day(self):
+        self.controller.settings.update(mute=False, dnd=False, fullscreen_dnd=False)
+        self.pet.show()
+        dates = (
+            (2027, 1, 1, "", "ch0335_season_newyear_1"),
+            (2027, 10, 31, "", "ch0335_season_halloween_1"),
+            (2027, 12, 25, "", "ch0335_season_xmas_1"),
+            (2028, 1, 1, "01-01", "ch0335_season_birthday_player_7"),
+        )
+        for year, month, day, birthday, voice_id in dates:
+            with self.subTest(voice_id=voice_id):
+                self.clock.value = datetime(year, month, day, 12).timestamp()
+                self.controller.settings["birthday_mmdd"] = birthday
+                self.controller._startup_greeted = False
+                self.pet.bubbles.clear()
+                self.pet.behaviors.restore_default()
+                with patch.object(self.controller.audio, "play", return_value=True) as play:
+                    self.controller.play_startup_greeting()
+                    self.controller._calendar_tick()
+                play.assert_called_once()
+                self.assertEqual(play.call_args.args[0]["id"], voice_id)
+        self.controller._startup_greeted = False
+        self.pet.behaviors.restore_default()
+        with patch.object(self.controller.audio, "play", return_value=True) as play:
+            self.controller.play_startup_greeting()
+        self.assertEqual(play.call_args.args[2], "greeting")
+
+    def test_startup_dnd_skips_without_late_playback(self):
+        self.clock.value = datetime(2027, 12, 25, 9).timestamp()
+        self.controller.settings.update(mute=False, dnd=True, fullscreen_dnd=False)
+        self.pet.show()
+        with patch.object(self.controller.audio, "play") as play:
+            self.controller.play_startup_greeting()
+            self.controller.settings["dnd"] = False
+            self.clock.value += 10
+            self.controller.tick()
+            self.controller.play_startup_greeting()
+        play.assert_not_called()
+        row = self.controller.storage.conn.execute("SELECT outcome FROM calendar_events").fetchone()
+        self.assertEqual(row["outcome"], "skipped")
 
     def test_shortcuts_execute_only_explicit_open_and_delete_keeps_target(self):
         target = self.path / "note.txt"

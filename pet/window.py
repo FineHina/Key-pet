@@ -4,8 +4,8 @@ import os
 import time
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QTimer, Qt
-from PySide6.QtGui import QAction, QCursor, QIcon, QPainter
-from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+from PySide6.QtGui import QCursor, QIcon, QPainter
+from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon, QWidget
 
 from . import config
 from .behaviors import Behaviors, EventBus
@@ -14,6 +14,7 @@ from .expressions import LABELS
 from .gestures import Gestures
 from .reaction_card import ReactionCard
 from .scene import BUBBLE_BAND, PET_H, PetScene
+from .ui_theme import apply_theme, colors, icon, resolved_dark
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LAYERS = os.path.join(ROOT, "assets", "layers")
@@ -51,6 +52,7 @@ class PetWindow(QWidget):
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setMouseTracking(True)
         self.scene = PetScene()
+        self.displayed_character_frame = None
         self.bus = EventBus()
         self.bubbles = BubbleManager()
         self.reaction_card = ReactionCard(self, self.bubbles.expressions)
@@ -90,15 +92,16 @@ class PetWindow(QWidget):
             self.assistant.attach_windows()
             self.assistant.changed.connect(self._update_assistant_status)
             self.assistant.shortcuts_changed.connect(self._refresh_shortcut_menu)
-            self.tray.setContextMenu(self._tray_menu())
-            self._update_assistant_status()
+            self._refresh_shortcut_menu()
 
     def _refresh_shortcut_menu(self):
+        previous = self.tray.contextMenu()
         self.tray.setContextMenu(self._tray_menu())
+        if previous is not None:
+            previous.deleteLater()
         self._update_assistant_status()
 
     def _open_shortcut(self, shortcut_id):
-        from PySide6.QtWidgets import QMessageBox
         try:
             self.assistant.open_shortcut(shortcut_id)
         except (ValueError, OSError) as error:
@@ -107,11 +110,27 @@ class PetWindow(QWidget):
     def _update_assistant_status(self):
         if hasattr(self, "tray"):
             self.tray.setToolTip(self.assistant.tray_status())
-        if hasattr(self, "_dnd_action"):
-            self._dnd_action.setChecked(self.assistant.settings.get("dnd", False))
-        if hasattr(self, "_assistant_action"):
-            count = len(self.assistant.pending_notifications())
-            self._assistant_action.setText(f"桌宠助手（{count}项待处理）" if count else "桌宠助手")
+        tray_menu = self.tray.contextMenu() if hasattr(self, "tray") else None
+        for menu in (tray_menu, self._menu):
+            if menu is not None and menu.isVisible() and hasattr(menu, "dnd_action"):
+                self._sync_menu(menu)
+
+    def _sync_menu(self, menu):
+        count = len(self.assistant.pending_notifications())
+        menu.assistant_action.setText(f"KEI 助手（{count} 项待处理）" if count else "KEI 助手")
+        manual = self.assistant.settings.get("dnd", False)
+        effective = self.assistant.policy.is_dnd()
+        menu.dnd_action.setChecked(manual)
+        menu.dnd_action.setText("手动勿扰 · 已开启" if manual else
+                                "手动勿扰 · 自动勿扰中" if effective else "手动勿扰")
+        snapshot = self.assistant.focus_snapshot()
+        menu.quick_focus.setEnabled(not snapshot or snapshot.get("state") not in ("running", "paused"))
+
+    def _quick_focus(self, minutes, kind):
+        try:
+            self.assistant.start_focus(minutes, kind)
+        except ValueError as error:
+            QMessageBox.warning(self, "无法开始计时", str(error))
 
     def _apply_size(self):
         self.setFixedSize(*self.scene.size_for(self.s))
@@ -127,9 +146,14 @@ class PetWindow(QWidget):
         config.save({"x": self.x(), "y": self.y(), "scale": self.s})
 
     def paintEvent(self, _):
+        frame = self.scene.sample(time.monotonic(), self.state, self.s)
         painter = QPainter(self)
-        painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
-        self.scene.paint(painter, time.monotonic(), self.state, self.s)
+        try:
+            painter.setRenderHints(QPainter.Antialiasing | QPainter.SmoothPixmapTransform | QPainter.TextAntialiasing)
+            frame.paint(painter)
+        finally:
+            painter.end()
+        self.displayed_character_frame = frame
 
     def _dispatch(self, events):
         for event, payload in events:
@@ -149,7 +173,7 @@ class PetWindow(QWidget):
                 continue
             self.bus.emit(event, **payload)
             if hasattr(self, "assistant"):
-                self.assistant.pointer_event(event)
+                self.assistant.pointer_event(event, payload.get("region"))
 
     def _tick_frame(self):
         if not self.isVisible():
@@ -162,9 +186,9 @@ class PetWindow(QWidget):
         self.state["sway"] += (self._sway_target - self.state["sway"]) * 0.25
         self.update()
 
-    def _region(self, gp, now=None):
-        lp = self.mapFromGlobal(gp)
-        return self.scene.hit_region(QPointF(lp), time.monotonic() if now is None else now, self.state, self.s)
+    def _region(self, gp):
+        frame = self.displayed_character_frame
+        return frame.hit_region(QPointF(self.mapFromGlobal(gp))) if frame is not None else None
 
     def _over_pet(self, gp):
         return self._region(gp) is not None
@@ -177,7 +201,7 @@ class PetWindow(QWidget):
         if not self.isVisible():
             return
         now = time.monotonic()
-        region = self._region(QCursor.pos(), now)
+        region = self._region(QCursor.pos())
         want = region is not None or self.gestures.pressed
         if want != self._passthrough:
             self._hwnd = int(self.winId())
@@ -247,6 +271,7 @@ class PetWindow(QWidget):
         return super().event(event)
 
     def hideEvent(self, event):
+        self.displayed_character_frame = None
         if hasattr(self, "gestures"):
             self._dispatch(self.gestures.cancel())
             self._reset_hover()
@@ -264,7 +289,7 @@ class PetWindow(QWidget):
 
     def _tray_init(self):
         self.tray = QSystemTrayIcon(QIcon(os.path.join(LAYERS, "tray.png")), self)
-        self.tray.setToolTip("凯伊 · Q版桌宠")
+        self.tray.setToolTip("KEI · 凯伊桌宠")
         self.tray.setContextMenu(self._tray_menu())
         self.tray.activated.connect(
             lambda reason: self.setVisible(not self.isVisible())
@@ -273,21 +298,47 @@ class PetWindow(QWidget):
 
     def _tray_menu(self):
         menu = QMenu(self)
+        def update_theme():
+            settings = self.assistant.settings if hasattr(self, "assistant") else {}
+            dark = resolved_dark(settings.get("assistant_theme", "system"))
+            if menu.property("darkTheme") != dark:
+                apply_theme(menu, dark)
+                t = colors(menu)
+                for action in menu.actions():
+                    if action.data():
+                        action.setIcon(icon(action.data(), t["accent"], 17))
+
+        menu.aboutToShow.connect(update_theme)
         if hasattr(self, "assistant"):
-            self._assistant_action = menu.addAction("桌宠助手", self.assistant.open_panel)
-            self._dnd_action = menu.addAction("勿扰模式")
-            self._dnd_action.setCheckable(True)
-            self._dnd_action.setChecked(self.assistant.settings.get("dnd", False))
-            self._dnd_action.triggered.connect(lambda enabled: self.assistant.update_settings({"dnd": enabled}))
-            menu.addAction("停止语音", self.assistant.stop_audio)
+            menu.assistant_action = menu.addAction("KEI 助手", lambda: self.assistant.open_panel())
+            menu.assistant_action.setData("halo")
+            menu.quick_focus = menu.addMenu("快速专注")
+            menu.quick_focus.menuAction().setData("focus")
+            menu.quick_focus.addAction("专注 25 分钟", lambda: self._quick_focus(25, "focus"))
+            menu.quick_focus.addAction("休息 5 分钟", lambda: self._quick_focus(5, "break"))
+            menu.addAction("陪伴对话", lambda: self.assistant.open_panel("陪伴对话")).setData("chat")
+            interaction = menu.addMenu("互动")
+            interaction.menuAction().setData("gift")
+            interaction.addAction("喂食与照顾", lambda: self.assistant.open_interaction("care"))
+            interaction.addAction("礼物图鉴", lambda: self.assistant.open_interaction("gifts"))
+            interaction.addAction("小游戏", lambda: self.assistant.open_interaction("games"))
             shortcuts = menu.addMenu("快捷工具")
-            for entry in self.assistant.shortcuts_list():
-                action = shortcuts.addAction(entry["name"])
-                action.triggered.connect(lambda checked=False, sid=entry["id"]: self._open_shortcut(sid))
-            shortcuts.addSeparator()
+            shortcuts.menuAction().setData("tools")
             shortcuts.addAction("管理快捷工具", lambda: self.assistant.open_panel("快捷工具"))
-            menu.addAction("陪伴对话", lambda: self.assistant.open_panel("陪伴对话"))
+            entries = self.assistant.shortcuts_list()
+            if entries:
+                shortcuts.addSeparator()
+            for entry in entries:
+                action = shortcuts.addAction(entry["name"].replace("&", "&&"))
+                action.triggered.connect(lambda checked=False, sid=entry["id"]: self._open_shortcut(sid))
             menu.addSeparator()
+            menu.dnd_action = menu.addAction("手动勿扰")
+            menu.dnd_action.setCheckable(True)
+            menu.dnd_action.triggered.connect(lambda enabled: self.assistant.update_settings({"dnd": enabled}))
+            menu.addAction("停止语音", self.assistant.stop_audio).setData("sound")
+            menu.addSeparator()
+            self._sync_menu(menu)
+            menu.aboutToShow.connect(lambda: self._sync_menu(menu))
         expressions = menu.addMenu("原立绘表情")
         for kind, label in LABELS.items():
             action = expressions.addAction(label)
@@ -303,10 +354,12 @@ class PetWindow(QWidget):
         if len(self.scene.animations):
             animations.addSeparator()
         animations.addAction("恢复普通待机", self._restore_default)
-        menu.addAction("显示/隐藏", lambda: self.setVisible(not self.isVisible()))
-        menu.addAction("重置位置", self._reset_pos)
+        display = menu.addMenu("显示与位置")
+        display.addAction("显示 / 隐藏桌宠", lambda: self.setVisible(not self.isVisible()))
+        display.addAction("重置位置", self._reset_pos)
         menu.addSeparator()
-        menu.addAction("退出", self._quit)
+        menu.addAction("退出桌宠", self._quit)
+        update_theme()
         return menu
 
     def _preview(self, kind):

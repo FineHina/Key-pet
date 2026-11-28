@@ -55,17 +55,17 @@ class ServiceTests(unittest.TestCase):
         return self.storage.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
 
     def test_migration_and_schema_reopen(self):
-        self.assertEqual(self.storage.conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(self.storage.conn.execute("PRAGMA user_version").fetchone()[0], 4)
         self.assertEqual(self.count("focus_sessions"), 0)
         self.restart()
-        self.assertEqual(self.storage.conn.execute("PRAGMA user_version").fetchone()[0], 2)
+        self.assertEqual(self.storage.conn.execute("PRAGMA user_version").fetchone()[0], 4)
         self.assertEqual(self.storage.pending(), [])
 
     def test_future_schema_rejected(self):
         path = Path(self.temp.name) / "future.db"
         conn = sqlite3.connect(path)
         try:
-            conn.execute("PRAGMA user_version = 3")
+            conn.execute("PRAGMA user_version = 5")
         finally:
             conn.close()
         with self.assertRaisesRegex(ValueError, "schema version"):
@@ -268,7 +268,7 @@ class ServiceTests(unittest.TestCase):
     def test_reminder_add_edit_list_validation(self):
         due = self.wall.now + 60
         item = self.reminders.add("  复习  ", due)
-        self.assertEqual(item, {"id": item["id"], "title": "复习", "due_at": due, "status": "scheduled"})
+        self.assertEqual(item, {"id": item["id"], "title": "复习", "due_at": due, "status": "scheduled", "time_mode": "absolute"})
         edited = self.reminders.edit(item["id"], "吃饭", due + 120)
         self.assertEqual(edited["title"], "吃饭")
         self.assertEqual(self.reminders.list_all(), [edited])
@@ -281,21 +281,51 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.count("reminders"), 1)
         self.assertEqual(len(self.reminders.add("x" * 500, due)["title"]), 500)
 
-    def test_reminder_tick_once_restart_and_edit_pending_rejected(self):
-        item = self.reminders.add("喝水", self.wall.now + 30)
-        self.assertEqual(self.reminders.tick(), [])
+    def test_pending_edits_replace_only_the_previous_occurrence(self):
+        item = self.reminders.add("喝水", self.wall.now + 30, time_mode="relative")
         self.advance(40)
         self.restart()
-        new = self.reminders.tick()
-        self.assertEqual(len(new), 1)
-        self.assertEqual((new[0]["kind"], new[0]["entity_id"], new[0]["body"]), ("reminder", item["id"], "喝水"))
-        self.assertEqual(self.reminders.list_all()[0]["status"], "pending")
-        with self.assertRaises(ValueError):
-            self.reminders.edit(item["id"], "other", self.wall.now + 30)
-        self.assertEqual(self.reminders.tick(), [])
+        old, = self.reminders.tick()
+        edited = self.reminders.edit(item["id"], "编辑描述")
+        self.assertEqual(edited["status"], "pending")
+        self.assertEqual(self.storage.pending()[0]["id"], old["id"])
+        self.assertEqual(self.storage.pending()[0]["body"], "编辑描述")
+        self.reminders.edit(item["id"], "新计划", self.wall.now + 30, time_mode="absolute")
+        self.assertEqual(self.storage.pending(), [])
         self.restart()
         self.assertEqual(self.reminders.tick(), [])
-        self.assertEqual(len(self.storage.pending()), 1)
+        self.advance(30)
+        new, = self.reminders.tick()
+        self.assertNotEqual(new["id"], old["id"])
+        self.storage.acknowledge(old["id"])
+        self.assertEqual(self.storage.pending()[0]["id"], new["id"])
+        self.assertEqual(self.reminders.tick(), [])
+
+    def test_edit_historical_reminders_keep_status_unless_rearmed_and_delete_scopes(self):
+        done = self.reminders.add("已完成", self.wall.now + 10)
+        cancelled = self.reminders.add("已取消", self.wall.now + 10)
+        self.reminders.cancel(cancelled["id"])
+        self.advance(10)
+        old, = self.reminders.tick()
+        self.storage.acknowledge(old["id"])
+        self.assertEqual(self.reminders.edit(done["id"], "历史修订", self.wall.now - 60)["status"], "done")
+        self.assertEqual(self.reminders.edit(cancelled["id"], "取消修订")["status"], "cancelled")
+        self.assertEqual(self.reminders.tick(), [])
+        with self.assertRaises(ValueError):
+            self.reminders.edit(done["id"], "不能重启", self.wall.now - 1, rearm=True)
+        due = self.wall.now + 20
+        self.assertEqual(self.reminders.edit(done["id"], "重新提醒", due, rearm=True)["status"], "scheduled")
+        self.restart()
+        self.advance(20)
+        new, = self.reminders.tick()
+        self.storage._insert_notification("focus", done["id"], "unrelated", "focus", "focus", due)
+        self.reminders.delete(done["id"])
+        with self.assertRaises(ValueError):
+            self.reminders.delete(done["id"])
+        self.restart()
+        self.assertEqual([row["id"] for row in self.reminders.list_all()], [cancelled["id"]])
+        self.assertEqual([row["kind"] for row in self.storage.pending()], ["focus"])
+        self.assertEqual(self.count("notifications"), 1)
 
     def test_cancel_and_complete_scheduled_or_pending_reminders(self):
         a = self.reminders.add("cancel", self.wall.now + 10)

@@ -5,7 +5,7 @@ import sqlite3
 
 
 class Storage:
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 4
 
     def __init__(self, path):
         path = os.fspath(path)
@@ -90,7 +90,49 @@ class Storage:
                     outcome TEXT NOT NULL CHECK(outcome IN ('triggered', 'skipped')),
                     created_at REAL NOT NULL
                 )""")
-                self.conn.execute("PRAGMA user_version = 2")
+            if version < 3:
+                self.conn.execute("""ALTER TABLE reminders ADD COLUMN time_mode TEXT NOT NULL
+                    DEFAULT 'absolute' CHECK(time_mode IN ('absolute', 'relative'))""")
+                self.conn.execute("""ALTER TABLE reminders ADD COLUMN schedule_revision INTEGER NOT NULL
+                    DEFAULT 0 CHECK(schedule_revision >= 0)""")
+            if version < 4:
+                self._create_interaction_tables()
+                self.conn.execute("PRAGMA user_version = 4")
+
+    def _create_interaction_tables(self):
+        statements = (
+            """CREATE TABLE companion_state (
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                affection INTEGER NOT NULL DEFAULT 0 CHECK(affection BETWEEN 0 AND 100),
+                mood TEXT NOT NULL DEFAULT 'calm',
+                mood_until REAL NOT NULL DEFAULT 0
+            )""",
+            "INSERT INTO companion_state (id) VALUES (1)",
+            """CREATE TABLE companion_scores (
+                event_key TEXT PRIMARY KEY,
+                local_date TEXT NOT NULL,
+                category TEXT NOT NULL,
+                points INTEGER NOT NULL CHECK(points BETWEEN 0 AND 2),
+                occurred_at REAL NOT NULL
+            )""",
+            """CREATE INDEX companion_daily_score ON companion_scores(local_date, category)""",
+            """CREATE TABLE gift_inventory (
+                gift_id TEXT PRIMARY KEY,
+                quantity INTEGER NOT NULL CHECK(quantity >= 0),
+                given INTEGER NOT NULL DEFAULT 0 CHECK(given >= 0)
+            )""",
+            """CREATE TABLE gift_rewards (
+                pack TEXT NOT NULL,
+                slot INTEGER NOT NULL CHECK(slot BETWEEN 0 AND 2),
+                gift_id TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                claimed INTEGER NOT NULL DEFAULT 0 CHECK(claimed IN (0, 1)),
+                PRIMARY KEY(pack, slot)
+            )""",
+            """CREATE INDEX gift_rewards_unclaimed ON gift_rewards(created_at) WHERE claimed = 0""",
+        )
+        for statement in statements:
+            self.conn.execute(statement)
 
     def claim_calendar_event(self, local_date, event_key, outcome, now):
         """Claim at most one automatic calendar event per local date, durably."""

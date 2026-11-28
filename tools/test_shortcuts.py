@@ -256,7 +256,9 @@ class MigrationAndCalendarTests(unittest.TestCase):
 
     @staticmethod
     def legacy_snapshot(conn):
-        return {table: conn.execute(f"SELECT * FROM {table} ORDER BY rowid").fetchall()
+        columns = "id, title, due_at, status, created_at, updated_at"
+        return {table: conn.execute(f"SELECT {columns if table == 'reminders' else '*'} "
+                                    f"FROM {table} ORDER BY rowid").fetchall()
                 for table in ("focus_sessions", "reminders", "notifications", "sqlite_sequence")}
 
     def test_actual_v1_migration_preserves_all_legacy_rows_and_schema(self):
@@ -285,12 +287,16 @@ class MigrationAndCalendarTests(unittest.TestCase):
             conn.close()
         storage = Storage(self.path)
         try:
-            self.assertEqual(Storage.SCHEMA_VERSION, 2)
-            self.assertEqual(storage.conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(Storage.SCHEMA_VERSION, 4)
+            self.assertEqual(storage.conn.execute("PRAGMA user_version").fetchone()[0], 4)
             after = {table: [tuple(row) for row in rows]
                      for table, rows in self.legacy_snapshot(storage.conn).items()}
             self.assertEqual(after, before)
+            modes = storage.conn.execute("SELECT time_mode, schedule_revision FROM reminders").fetchall()
+            self.assertTrue(all(tuple(row) == ("absolute", 0) for row in modes))
             for name, sql in schema:
+                if name == "reminders":
+                    continue
                 self.assertEqual(storage.conn.execute(
                     "SELECT sql FROM sqlite_master WHERE name = ?", (name,)).fetchone()[0], sql)
             self.assertEqual(storage.conn.execute("SELECT count(*) FROM shortcuts").fetchone()[0], 0)
@@ -303,10 +309,10 @@ class MigrationAndCalendarTests(unittest.TestCase):
         finally:
             storage.close()
 
-    def test_fresh_v2_schema_and_constraints(self):
+    def test_fresh_v4_schema_and_constraints(self):
         storage = Storage(self.path)
         try:
-            self.assertEqual(storage.conn.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(storage.conn.execute("PRAGMA user_version").fetchone()[0], 4)
             for table in ("focus_sessions", "reminders", "notifications", "shortcuts", "calendar_events"):
                 self.assertEqual(storage.conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0], 0)
             for values in (("Bad", "script", "x", 0), ("", "web", "https://example.invalid", 0)):

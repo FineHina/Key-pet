@@ -160,6 +160,11 @@ class ShortcutsService:
                                              ((other["position"], id), (item["position"], other["id"])))
             return self.list_all()
 
+    def check(self, id):
+        """Validate the stored target without opening or modifying it."""
+        item = self._dict(self._get(id))
+        return self._validate(item["name"], item["kind"], item["target"])[2]
+
     def open(self, id):
         """Return success for an accepted launch request, not application completion."""
         item = self._dict(self._get(id))

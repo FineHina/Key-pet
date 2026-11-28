@@ -161,8 +161,7 @@ class AnimationTests(unittest.TestCase):
             AnimationLibrary(self.root / "missing.json")
 
     def test_scene_frame_hit_regions_and_single_image_then_bubble(self):
-        scene = PetScene.__new__(PetScene)
-        scene.animations = AnimationLibrary(self.path)
+        scene = PetScene(animation_manifest=self.path)
         state = {"animation": {"clip": "wave", "t0": 10}, "sway": 0,
                  "dragging": False,
                  "bubble": {"text": "你好", "t0": 10, "dur": 2.4}}

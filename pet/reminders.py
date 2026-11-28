@@ -12,7 +12,7 @@ class ReminderService:
 
     @staticmethod
     def _dict(row):
-        return {key: row[key] for key in ("id", "title", "due_at", "status")}
+        return {key: row[key] for key in ("id", "title", "due_at", "status", "time_mode")}
 
     @staticmethod
     def _title(title):
@@ -34,26 +34,61 @@ class ReminderService:
             raise ValueError("Reminder not found")
         return row
 
-    def add(self, title, due_at):
+    @staticmethod
+    def _time_mode(mode):
+        if mode not in ("absolute", "relative"):
+            raise ValueError("提醒方式无效。")
+        return mode
+
+    def add(self, title, due_at, time_mode="absolute"):
         now = self.wall_clock()
         title, due_at = self._title(title), self._due(due_at, now)
+        mode = self._time_mode(time_mode)
         with self.storage.transaction():
             cursor = self.storage.conn.execute(
-                """INSERT INTO reminders (title, due_at, status, created_at, updated_at)
-                    VALUES (?, ?, 'scheduled', ?, ?)""", (title, due_at, now, now))
+                """INSERT INTO reminders (title, due_at, status, created_at, updated_at, time_mode)
+                    VALUES (?, ?, 'scheduled', ?, ?, ?)""", (title, due_at, now, now, mode))
             return self._dict(self._get(cursor.lastrowid))
 
-    def edit(self, reminder_id, title, due_at):
+    def edit(self, reminder_id, title, due_at=None, *, time_mode=None, rearm=False):
         now = self.wall_clock()
-        title, due_at = self._title(title), self._due(due_at, now)
+        title = self._title(title)
         with self.storage.transaction():
             row = self._get(reminder_id)
-            if row["status"] != "scheduled":
-                raise ValueError("Only scheduled reminders can be edited")
+            status = row["status"]
+            mode = row["time_mode"] if time_mode is None else self._time_mode(time_mode)
+            if due_at is None:
+                due_at = row["due_at"]
+            if (isinstance(due_at, bool) or not isinstance(due_at, (int, float))
+                    or not math.isfinite(due_at)):
+                raise ValueError("请选择有效的提醒时间。")
+            time_changed = due_at != row["due_at"]
+            reschedule = rearm or (time_changed and status in ("scheduled", "pending"))
+            if reschedule:
+                due_at = self._due(due_at, now)
+                status = "scheduled"
+                self._acknowledge_pending(reminder_id)
+            elif status == "pending":
+                self.storage.conn.execute(
+                    """UPDATE notifications SET body = ? WHERE kind = 'reminder'
+                        AND entity_id = ? AND status = 'pending'""", (title, reminder_id))
             self.storage.conn.execute(
-                "UPDATE reminders SET title = ?, due_at = ?, updated_at = ? WHERE id = ?",
-                (title, due_at, now, reminder_id))
+                """UPDATE reminders SET title = ?, due_at = ?, updated_at = ?, status = ?,
+                    time_mode = ?, schedule_revision = schedule_revision + ? WHERE id = ?""",
+                (title, due_at, now, status, mode, int(reschedule), reminder_id))
             return self._dict(self._get(reminder_id))
+
+    def delete(self, reminder_id):
+        with self.storage.transaction():
+            self._get(reminder_id)
+            self.storage.conn.execute(
+                "DELETE FROM notifications WHERE kind = 'reminder' AND entity_id = ?", (reminder_id,))
+            self.storage.conn.execute("DELETE FROM reminders WHERE id = ?", (reminder_id,))
+
+    def _acknowledge_pending(self, reminder_id):
+        self.storage.conn.execute(
+            """UPDATE notifications SET status = 'acknowledged'
+                WHERE kind = 'reminder' AND entity_id = ? AND status = 'pending'""", (reminder_id,))
 
     def _resolve(self, reminder_id, status):
         now = self.wall_clock()
@@ -66,10 +101,7 @@ class ReminderService:
             self.storage.conn.execute(
                 "UPDATE reminders SET status = ?, updated_at = ? WHERE id = ?",
                 (status, now, reminder_id))
-            self.storage.conn.execute(
-                """UPDATE notifications SET status = 'acknowledged'
-                    WHERE kind = 'reminder' AND entity_id = ? AND status = 'pending'""",
-                (reminder_id,))
+            self._acknowledge_pending(reminder_id)
             return self._dict(self._get(reminder_id))
 
     def cancel(self, reminder_id):
@@ -93,7 +125,8 @@ class ReminderService:
             self.storage.conn.execute(
                 "UPDATE notifications SET status = 'acknowledged' WHERE id = ?", (notification_id,))
             self.storage.conn.execute(
-                "UPDATE reminders SET status = 'scheduled', due_at = ?, updated_at = ? WHERE id = ?",
+                """UPDATE reminders SET status = 'scheduled', due_at = ?, updated_at = ?,
+                    time_mode = 'relative', schedule_revision = schedule_revision + 1 WHERE id = ?""",
                 (due_at, now, row["id"]))
             return self._dict(self._get(row["id"]))
 
@@ -114,6 +147,8 @@ class ReminderService:
                     (now, row["id"]))
                 # repr of a float round-trips, preventing subsecond key collisions.
                 key = f"{row['id']}:{repr(float(row['due_at']))}"
+                if row["schedule_revision"]:
+                    key += f":{row['schedule_revision']}"
                 notification = self.storage._insert_notification(
                     "reminder", row["id"], key, "提醒", row["title"], row["due_at"])
                 if notification is not None:

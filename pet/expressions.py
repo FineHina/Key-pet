@@ -16,11 +16,8 @@ GROUPS = {
     "embarrassed": (12,), "dark_angry": (23,), "angry": (24, 25),
     "blush": (26, 27, 28), "cry": (29, 30, 31),
 }
-# Differentials ship inside the repo; fall back to the legacy sibling folder.
 _REPO_ROOT = Path(__file__).resolve().parents[1]
-_BUNDLED_ROOT = _REPO_ROOT / "assets" / "differentials"
-_LEGACY_ROOT = Path(__file__).resolve().parents[2] / "天童凯伊 - 初始立绘差分"
-SOURCE_ROOT = _BUNDLED_ROOT if _BUNDLED_ROOT.is_dir() else _LEGACY_ROOT
+SOURCE_ROOT = _REPO_ROOT / "assets" / "differentials"
 
 
 class Expressions:

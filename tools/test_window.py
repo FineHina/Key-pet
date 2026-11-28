@@ -8,11 +8,12 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from PySide6.QtCore import QEvent, QPointF, Qt
-from PySide6.QtGui import QMouseEvent
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRectF, Qt
+from PySide6.QtGui import QImage, QMouseEvent, QTransform
 from PySide6.QtWidgets import QApplication
 
 from pet.behaviors import Behaviors
+from pet.character_renderer import CharacterFrame, CharacterLayer, image_alpha
 from pet.window import PetWindow
 
 APP = QApplication.instance() or QApplication([])
@@ -147,6 +148,29 @@ class WindowTests(unittest.TestCase):
         self.assertIsNone(self.win.state["animation"])
         self.assertEqual(self.win.pos(), before)
         self.save.assert_not_called()
+
+    def test_hit_testing_waits_for_the_new_frame_to_be_painted(self):
+        image = QImage(20, 20, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.white)
+        layer = CharacterLayer(image, image_alpha(image), QTransform(), region="head")
+        first = CharacterFrame((layer,), QRectF(20, 130, 20, 20))
+        second = CharacterFrame((layer,), QRectF(60, 130, 20, 20))
+        with patch.object(self.win.scene, "sample", return_value=first) as sample:
+            del self.win._region
+            self.win.show()
+            APP.processEvents()
+            old_point = self.win.mapToGlobal(QPoint(25, 135))
+            new_point = self.win.mapToGlobal(QPoint(65, 135))
+            self.assertIs(self.win.displayed_character_frame, first)
+            sample.return_value = second
+            self.assertEqual(self.win._region(old_point), "head")
+            self.assertIsNone(self.win._region(new_point))
+            self.win.repaint()
+            self.assertIs(self.win.displayed_character_frame, second)
+            self.assertIsNone(self.win._region(old_point))
+            self.assertEqual(self.win._region(new_point), "head")
+            self.win.hide()
+            self.assertIsNone(self.win.displayed_character_frame)
 
     def test_menu_includes_all_expression_categories(self):
         menu = self.win._tray_menu()

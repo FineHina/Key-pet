@@ -2,10 +2,12 @@
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QListWidget, QListWidgetItem, QMessageBox,
-    QPushButton, QVBoxLayout, QWidget,
+    QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
-from .assistant_panel import KIND_LABELS, STYLE, _spin
+from .assistant_panel import KIND_LABELS, _spin
+from .character_art import CharacterArt
+from .ui_theme import apply_theme, apply_titlebar, resolved_dark
 
 
 class NotificationWindow(QWidget):
@@ -15,34 +17,42 @@ class NotificationWindow(QWidget):
         super().__init__(parent, Qt.Tool | Qt.WindowStaysOnTopHint)
         self.controller = controller
         self.setObjectName("notificationWindow")
-        self.setWindowTitle("桌宠提醒")
+        self.setWindowTitle("KEI · 桌宠提醒")
         self.setAttribute(Qt.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WA_QuitOnClose, False)
         # Do not use WindowDoesNotAcceptFocus / TransparentForInput: controls need mouse input.
-        self.setStyleSheet(STYLE)
+        self.set_theme(resolved_dark(getattr(controller, "settings", {}).get("assistant_theme", "system")))
         self.setMinimumWidth(390)
         self.resize(420, 440)
         self._items = []
         layout = QVBoxLayout(self)
         self.queue_label = QLabel("待处理通知")
-        self.queue_label.setStyleSheet("color: #635077; font-size: 14px;")
+        self.queue_label.setProperty("role", "muted")
         layout.addWidget(self.queue_label)
         self.title_label = QLabel()
         self.title_label.setTextFormat(Qt.PlainText)
         self.title_label.setWordWrap(True)
-        self.title_label.setStyleSheet("font-size: 19px; color: #635077; padding: 6px 0;")
-        layout.addWidget(self.title_label)
-        self.body_label = QLabel()
-        self.body_label.setTextFormat(Qt.PlainText)
-        self.body_label.setWordWrap(True)
-        self.body_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self.body_label)
+        self.title_label.setProperty("role", "heading")
+        self.body_text = QTextEdit()
+        self.body_text.setReadOnly(True)
+        self.body_text.setAcceptRichText(False)
+        self.body_text.setFixedHeight(68)
+        self.body_text.setAccessibleName("通知内容")
+        header = QHBoxLayout()
+        self.art = CharacterArt("reminder", 70)
+        header.addWidget(self.art)
+        text = QVBoxLayout()
+        text.addWidget(self.title_label)
+        text.addWidget(self.body_text)
+        header.addLayout(text, 1)
+        layout.addLayout(header)
         self.pending_list = QListWidget()
         self.pending_list.setMaximumHeight(140)
         self.pending_list.currentRowChanged.connect(self._selection_changed)
         layout.addWidget(self.pending_list)
         row = QHBoxLayout()
         self.complete_button = QPushButton("完成")
+        self.complete_button.setProperty("role", "primary")
         self.complete_button.clicked.connect(self._complete)
         self.snooze5_button = QPushButton("稍后 5 分钟")
         self.snooze5_button.clicked.connect(lambda: self._snooze(5))
@@ -79,14 +89,25 @@ class NotificationWindow(QWidget):
         controller.changed.connect(self._refresh)
         self._selection_changed()
 
+    def showEvent(self, event):
+        super().showEvent(event)
+        apply_titlebar(self)
+
+    def set_theme(self, dark):
+        apply_theme(self, dark)
+        apply_titlebar(self)
+
     def sync(self, items):
         """Replace the entire queue, preserve selection, hide if empty; never show/raise.
 
         Main calls show() only after its DND checks and handles presentation bookkeeping.
         """
+        incoming = [dict(item) for item in items]
+        if incoming == self._items:
+            return
         selected = self.current_item()
         selected_id = selected.get("id") if selected else None
-        self._items = [dict(item) for item in items]
+        self._items = incoming
         self.pending_list.blockSignals(True)
         self.pending_list.clear()
         selected_row = 0
@@ -114,8 +135,10 @@ class NotificationWindow(QWidget):
     def _selection_changed(self, *_):
         item = self.current_item()
         enabled = item is not None
+        kind = item.get("kind") if item else None
+        self.art.set_state({"focus": "complete", "break": "sleepy", "reminder": "reminder"}.get(kind, "avatar"))
         self.title_label.setText(str(item.get("title", "")) if item else "没有待处理通知")
-        self.body_label.setText(str(item.get("body", "")) if item else "")
+        self.body_text.setPlainText(str(item.get("body", "")) if item else "")
         self.complete_button.setEnabled(enabled)
         for button in (self.snooze5_button, self.snooze10_button, self.snooze_custom_button):
             button.setEnabled(enabled and item.get("kind") == "reminder")

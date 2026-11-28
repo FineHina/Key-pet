@@ -195,7 +195,7 @@ def prepare_clip(name, spec):
     gif_frames[0].save(OUT / f"{name}.gif", save_all=True, append_images=gif_frames[1:],
                        duration=round(1000 / TARGET_FPS), loop=0, disposal=2)
     return {
-        "label": spec["label"], "source": str(spec["source"]), "mode": spec["mode"],
+        "label": spec["label"], "source": spec["source"].name, "mode": spec["mode"],
         "idle": spec["idle"], "canvas": list(CANVAS), "anchor": list(TARGET_ANCHOR),
         "head_cut_y": head_cut, "frames": frames_manifest,
         "duration": sum(item["duration"] for item in frames_manifest),

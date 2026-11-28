@@ -4,16 +4,21 @@ Integration: tabs.addTab(DialoguePage(controller), "聊天 / 纪念日") and
  tabs.addTab(ShortcutsPage(controller), "快捷入口"). No panel import is required.
 """
 from collections import deque
-from datetime import date
+from datetime import date, datetime
 import re
 
-from PySide6.QtCore import QSignalBlocker, Qt
+from PySide6.QtCore import QEvent, QFileInfo, QRectF, Signal, QSignalBlocker, QSize, Qt
+from PySide6.QtGui import QColor, QKeySequence, QPainter, QShortcut, QTextBlockFormat, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMessageBox, QPushButton, QTableWidget,
-    QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget,
+    QAbstractItemView, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFileIconProvider, QFormLayout, QGridLayout, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMenu,
+    QMessageBox, QPushButton, QSizePolicy, QStackedWidget, QTableWidget, QTableWidgetItem,
+    QTextEdit, QVBoxLayout, QWidget,
 )
+
+from .character_art import CharacterArt
+from .ui_theme import CONTROL_GAP, PAGE_MARGIN, card, colors, icon, label, scroll_body
 
 
 TOPICS = (
@@ -107,6 +112,69 @@ def _shortcut_values(owner):
     return name, kind, target
 
 
+class _DialogueHistory(QTextEdit):
+    """Draw rounded message backgrounds while retaining selectable transcript text."""
+
+    replay_requested = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.voices = {}
+        self.timestamps = {}
+        self.replay_targets = []
+        self.document().setDocumentMargin(27)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            for rect, voice in self.replay_targets:
+                if rect.contains(event.position()):
+                    self.replay_requested.emit(voice)
+                    return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        self.replay_targets.clear()
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(Qt.NoPen)
+        t = colors(self.window())
+        block = self.document().begin()
+        while block.isValid():
+            lines = block.layout()
+            count = lines.lineCount()
+            if block.text() and count:
+                first = self.cursorRect(QTextCursor(block))
+                last_line = lines.lineAt(count - 1)
+                top = first.top() - 4
+                bottom = first.top() + last_line.y() + last_line.height() + 4
+                if bottom >= 0 and top < self.viewport().height():
+                    extent = max(lines.lineAt(index).naturalTextWidth() for index in range(count))
+                    fmt = block.blockFormat()
+                    right_aligned = bool(fmt.alignment() & Qt.AlignRight)
+                    margin = self.document().documentMargin()
+                    left = (self.viewport().width() - margin - fmt.rightMargin() - extent
+                            if right_aligned else margin + fmt.leftMargin())
+                    painter.setBrush(QColor(t["bubble" if right_aligned else "panel"]))
+                    painter.drawRoundedRect(QRectF(left - 7, top, extent + 14, bottom - top), 8, 8)
+                    stamp = self.timestamps.get(block.blockNumber())
+                    if stamp:
+                        painter.setPen(QColor(t["muted"]))
+                        painter.drawText(QRectF(0, top - 21, self.viewport().width(), 16), Qt.AlignCenter, stamp)
+                        painter.setPen(Qt.NoPen)
+                    voice = self.voices.get(block.blockNumber())
+                    if voice:
+                        replay = QRectF(min(left + extent + 13, self.viewport().width() - 28), top, 24, 23)
+                        painter.setBrush(QColor(t["panel"]))
+                        painter.drawRoundedRect(replay, 7, 7)
+                        painter.setPen(QColor(t["accent"]))
+                        painter.drawText(replay, Qt.AlignCenter, "▶")
+                        painter.setPen(Qt.NoPen)
+                        self.replay_targets.append((replay, voice))
+            block = block.next()
+        painter.end()
+        super().paintEvent(event)
+
+
 class DialoguePage(QWidget):
     """Local, non-AI dialogue with at most 30 exchanges / 60 plain-text lines.
 
@@ -122,8 +190,55 @@ class DialoguePage(QWidget):
         self._event = None
         self._settings_snapshot = {}
         layout = QVBoxLayout(self)
-        layout.addWidget(_label("本地话题陪伴（非 AI），不联网推理；聊天记录仅保留在本页内存中。"))
+        layout.setContentsMargins(PAGE_MARGIN, 16, PAGE_MARGIN, 16)
+        layout.setSpacing(CONTROL_GAP)
+        identity, identity_box = card(margin=9)
+        identity_row = QHBoxLayout()
+        identity_row.addWidget(CharacterArt("avatar", 42))
+        name = QVBoxLayout()
+        name.setSpacing(0)
+        name.addWidget(label("日常对话 · KEI", "heading"))
+        name.addWidget(label("本地话题 · 非 AI", "muted"))
+        identity_row.addLayout(name, 1)
+        if hasattr(controller, "open_interaction"):
+            identity_row.addWidget(_button("互动", "interaction", lambda: controller.open_interaction()))
+        identity_row.addWidget(_button("纪念日", "calendar", self._open_calendar))
+        more = QPushButton("更多")
+        self.replay_menu = QMenu("语音重播", more)
+        self.replay_menu.setEnabled(False)
+        menu = QMenu(more)
+        if hasattr(controller, "audition"):
+            menu.addMenu(self.replay_menu)
+        self.clear_button = _button("清空记录", "clear_button", self._confirm_clear)
+        menu.addAction("清空记录…", self.clear_button.click)
+        more.setMenu(menu)
+        identity_row.addWidget(more)
+        identity_box.addLayout(identity_row)
+        layout.addWidget(identity)
+        self.transcript = QStackedWidget()
+        self.history = _DialogueHistory()
+        self.history.setObjectName("history")
+        self.history.setAccessibleName("陪伴对话记录")
+        self.history.setReadOnly(True)
+        self.history.setAcceptRichText(False)
+        self.history.document().setMaximumBlockCount(60)
+        self.history.setMinimumHeight(80)
+        if hasattr(controller, "audition"):
+            self.history.replay_requested.connect(self._replay)
+        self.transcript.addWidget(self.history)
+        empty, empty_box = card(margin=5)
+        empty_box.addStretch()
+        empty_box.addWidget(CharacterArt("chat", 150, 137), alignment=Qt.AlignCenter)
+        empty_hint = label("选择一个话题，或输入想聊的内容。", "muted")
+        empty_hint.setWordWrap(False)
+        empty_hint.setAlignment(Qt.AlignCenter)
+        empty_box.addWidget(empty_hint)
+        empty_box.addStretch()
+        self.transcript.addWidget(empty)
+        self.transcript.setCurrentWidget(empty)
+        layout.addWidget(self.transcript, 1)
         topics = QGridLayout()
+        topics.setSpacing(5)
         self.topic_buttons = {}
         for index, (topic, title) in enumerate(TOPICS):
             button = _button(title, "topic_" + topic,
@@ -132,12 +247,6 @@ class DialoguePage(QWidget):
             self.topic_buttons[topic] = button
             topics.addWidget(button, index // 4, index % 4)
         layout.addLayout(topics)
-        self.history = QTextEdit()
-        self.history.setObjectName("history")
-        self.history.setReadOnly(True)
-        self.history.setAcceptRichText(False)
-        self.history.document().setMaximumBlockCount(60)
-        layout.addWidget(self.history, 1)
         row = QHBoxLayout()
         self.input = QLineEdit()
         self.input.setObjectName("input")
@@ -146,12 +255,23 @@ class DialoguePage(QWidget):
         self.input.returnPressed.connect(self._send)
         row.addWidget(self.input, 1)
         self.send_button = _button("发送", "send_button", self._send)
-        self.clear_button = _button("清空记录", "clear_button", self._clear)
+        self.send_button.setProperty("role", "primary")
         row.addWidget(self.send_button)
-        row.addWidget(self.clear_button)
         layout.addLayout(row)
-        group = QGroupBox("生日与今日纪念")
-        form = QFormLayout(group)
+        footer = QHBoxLayout()
+        self.status_label = _label()
+        self.status_label.setObjectName("status_label")
+        self.status_label.setWordWrap(False)
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        footer.addWidget(self.status_label, 1)
+        self.count_label = label("0 / 500", "muted")
+        self.input.textChanged.connect(lambda text: self.count_label.setText(f"{len(text)} / 500"))
+        footer.addWidget(self.count_label)
+        layout.addLayout(footer)
+        self.calendar_dialog = QDialog(self)
+        self.calendar_dialog.setWindowTitle("KEI · 生日与纪念日")
+        self.calendar_dialog.setMinimumWidth(380)
+        form = QFormLayout(self.calendar_dialog)
         self.birthday_input = QLineEdit()
         self.birthday_input.setObjectName("birthday_input")
         self.birthday_input.setMaxLength(5)
@@ -167,13 +287,16 @@ class DialoguePage(QWidget):
         form.addRow("今日", self.event_label)
         self.event_button = _button("今日纪念回应", "event_button", self._trigger_event)
         form.addRow(self.event_button)
-        layout.addWidget(group)
-        self.status_label = _label()
-        self.status_label.setObjectName("status_label")
-        layout.addWidget(self.status_label)
+        close = QPushButton("关闭")
+        close.clicked.connect(self.calendar_dialog.close)
+        form.addRow(close)
         self._load_settings()
         controller.changed.connect(self.refresh)
         self.refresh()
+
+    def _open_calendar(self):
+        self.calendar_dialog.setModal(True)
+        self.calendar_dialog.show()
 
     def _load_settings(self):
         settings = self.controller.settings
@@ -219,13 +342,67 @@ class DialoguePage(QWidget):
         except Exception as error:
             _warn(self, error)
             return False
-        self._history.append((_line(user_text, 500), _line(text)))
-        self.history.setPlainText("\n".join(
-            f"你：{user}\n凯伊：{bot}" for user, bot in self._history))
+        voice_id = reaction.get("voice_id") if isinstance(reaction, dict) else None
+        self._history.append((_line(user_text, 500), _line(text), voice_id, datetime.now()))
+        self._render_history()
+        self.transcript.setCurrentWidget(self.history)
+        self.replay_menu.clear()
+        for _, reply, voice_id, _ in reversed(self._history):
+            if voice_id and hasattr(self.controller, "audition"):
+                self.replay_menu.addAction(reply[:34] + ("…" if len(reply) > 34 else ""),
+                                           lambda checked=False, i=voice_id: self._replay(i))
+        self.replay_menu.setEnabled(bool(self.replay_menu.actions()))
         scrollbar = self.history.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-        self.status_label.setText(str(notice) if notice else "本地回应；语音是否播放由助手控制。")
+        self.status_label.setText(str(notice) if notice else "")
         return True
+
+    def _render_history(self):
+        bar = self.history.verticalScrollBar()
+        position = bar.value()
+        previous = self.history.textCursor()
+        anchor, caret = previous.anchor(), previous.position()
+        self.history.clear()
+        cursor = QTextCursor(self.history.document())
+        t = colors(self.window())
+        first = True
+        last_stamp = None
+        self.history.voices.clear()
+        self.history.timestamps.clear()
+        for user, reply, voice, moment in self._history:
+            for is_user, text in ((True, user), (False, reply)):
+                timestamp = is_user and (last_stamp is None or (moment - last_stamp).total_seconds() >= 300)
+                block = QTextBlockFormat()
+                block.setAlignment(Qt.AlignRight if is_user else Qt.AlignLeft)
+                block.setLeftMargin(56 if is_user else 11)
+                block.setRightMargin(11 if is_user else 56)
+                block.setLineHeight(120, QTextBlockFormat.ProportionalHeight.value)
+                block.setTopMargin(29 if timestamp else 12)
+                block.setBottomMargin(12)
+                style = QTextCharFormat()
+                style.setForeground(QColor(t["text"]))
+                if first:
+                    cursor.setBlockFormat(block)
+                    first = False
+                else:
+                    cursor.insertBlock(block)
+                if timestamp:
+                    self.history.timestamps[cursor.blockNumber()] = moment.strftime("%H:%M")
+                    last_stamp = moment
+                if voice and not is_user:
+                    self.history.voices[cursor.blockNumber()] = voice
+                cursor.insertText(text, style)
+        end = self.history.document().characterCount() - 1
+        cursor.setPosition(min(anchor, end))
+        cursor.setPosition(min(caret, end), QTextCursor.KeepAnchor)
+        self.history.setTextCursor(cursor)
+        bar.setValue(position)
+
+    def _replay(self, voice_id):
+        try:
+            self.controller.audition(voice_id)
+        except Exception as error:
+            _warn(self, error)
 
     def _send(self):
         text = self.input.text().strip()
@@ -239,9 +416,18 @@ class DialoguePage(QWidget):
         title = dict(TOPICS)[topic]
         self._respond("话题：" + title, self.controller.dialogue_topic, topic)
 
+    def _confirm_clear(self):
+        if self._history and QMessageBox.question(
+                self, "清空对话", "清空本次对话记录？",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) == QMessageBox.Yes:
+            self._clear()
+
     def _clear(self):
         self._history.clear()
-        self.history.clear()
+        self._render_history()
+        self.transcript.setCurrentIndex(1)
+        self.replay_menu.clear()
+        self.replay_menu.setEnabled(False)
         self.status_label.clear()
 
     def _save_settings(self):
@@ -277,7 +463,7 @@ class _ShortcutEditDialog(QDialog):
     def __init__(self, shortcut, on_save, parent=None):
         super().__init__(parent)
         self.setObjectName("shortcut_edit_dialog")
-        self.setWindowTitle("编辑快捷入口")
+        self.setWindowTitle("KEI · 编辑快捷入口")
         self.setModal(True)
         self.resize(520, 230)
         self._on_save = on_save
@@ -291,6 +477,7 @@ class _ShortcutEditDialog(QDialog):
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.save_button = self.buttons.button(QDialogButtonBox.Ok)
         self.save_button.setText("保存")
+        self.save_button.setProperty("role", "primary")
         self.save_button.setObjectName("save_button")
         self.buttons.accepted.connect(self._save)
         self.buttons.rejected.connect(self.reject)
@@ -319,15 +506,80 @@ class ShortcutsPage(QWidget):
     def __init__(self, controller, parent=None):
         super().__init__(parent)
         self.controller = controller
-        self._shortcuts = []
-        layout = QVBoxLayout(self)
-        layout.addWidget(_label("快捷入口只保存名称和目标。删除入口不会删除目标文件；网页不会自动打开。"))
-        group = QGroupBox("新增快捷入口")
+        self._shortcuts = None
+        self._target_errors = {}
+        self._target_icons = {}
+        self._system_icons = QFileIconProvider()
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        layout = scroll_body(outer)
+        layout.addWidget(label("快捷工作台", "title"))
+        switcher = QHBoxLayout()
+        self.views = QStackedWidget()
+        view_buttons = QButtonGroup(self)
+        for index, title in enumerate(("网格", "管理列表")):
+            button = QPushButton(title)
+            button.setProperty("role", "segment")
+            button.setCheckable(True)
+            view_buttons.addButton(button, index)
+            switcher.addWidget(button)
+        view_buttons.button(0).setChecked(True)
+        view_buttons.idClicked.connect(self.views.setCurrentIndex)
+        switcher.addStretch()
+        add_entry = _button("＋ 添加入口", "open_add_dialog", self._open_add_dialog)
+        add_entry.hide()
+        self.views.currentChanged.connect(lambda index: add_entry.setVisible(index == 1))
+        switcher.addWidget(add_entry)
+        layout.addLayout(switcher)
+        self.add_dialog = QDialog(self)
+        self.add_dialog.setWindowTitle("KEI · 添加快捷入口")
+        self.add_dialog.setModal(True)
+        self.add_dialog.setMinimumWidth(410)
+        dialog_layout = QVBoxLayout(self.add_dialog)
         form = _shortcut_fields(self)
-        group.setLayout(form)
+        dialog_layout.addLayout(form)
         self.add_button = _button("添加", "add_button", self._add)
-        form.addRow(self.add_button)
-        layout.addWidget(group)
+        self.add_button.setProperty("role", "primary")
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(_button("取消", "cancel_add", self.add_dialog.reject))
+        actions.addWidget(self.add_button)
+        dialog_layout.addLayout(actions)
+        self.grid = QListWidget()
+        self.grid.setProperty("role", "launcherGrid")
+        self.grid.setAccessibleName("快捷工具启动器")
+        self.grid.setViewMode(QListView.IconMode)
+        self.grid.setMovement(QListView.Static)
+        self.grid.setResizeMode(QListView.Adjust)
+        self.grid.setUniformItemSizes(True)
+        self.grid.setWrapping(True)
+        self.grid.setGridSize(QSize(132, 90))
+        self.grid.setIconSize(QSize(29, 29))
+        self.grid.setMinimumHeight(184)
+        self.grid.setWordWrap(False)
+        self.grid.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.grid.itemClicked.connect(self._activate_tile)
+        self.grid.setMouseTracking(True)
+        self.grid.viewport().installEventFilter(self)
+        self.hover_more = QPushButton("⋯", self.grid.viewport())
+        self.hover_more.setAccessibleName("快捷入口更多操作")
+        self.hover_more.setFixedSize(28, 25)
+        self.hover_more.hide()
+        self.hover_more.clicked.connect(lambda: self._grid_menu(self.hover_more.pos()))
+        self.grid.itemEntered.connect(self._show_tile_menu)
+        self.grid.verticalScrollBar().valueChanged.connect(self.hover_more.hide)
+        for key in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Space):
+            shortcut = QShortcut(QKeySequence(key), self.grid)
+            shortcut.setContext(Qt.WidgetShortcut)
+            shortcut.activated.connect(lambda: self._activate_tile(self.grid.currentItem()))
+        self.grid.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.grid.customContextMenuRequested.connect(self._grid_menu)
+        self.views.addWidget(self.grid)
+        manager = QWidget()
+        manager_layout = QVBoxLayout(manager)
+        manager_layout.setContentsMargins(0, 0, 0, 0)
+        self.views.addWidget(manager)
+        layout.addWidget(self.views, 1)
         self.table = QTableWidget(0, 3)
         self.table.setObjectName("table")
         self.table.setHorizontalHeaderLabels(["名称", "类型", "目标"])
@@ -336,11 +588,12 @@ class ShortcutsPage(QWidget):
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSortingEnabled(False)
         self.table.verticalHeader().hide()
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Interactive)
+        self.table.setColumnWidth(0, 130)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         self.table.itemSelectionChanged.connect(self._selection_changed)
-        layout.addWidget(self.table, 1)
+        manager_layout.addWidget(self.table, 1)
         row = QHBoxLayout()
         for name, title, callback in (
             ("open_button", "打开", self._open), ("edit_button", "编辑", self._edit),
@@ -351,7 +604,11 @@ class ShortcutsPage(QWidget):
             button = _button(title, name, callback)
             setattr(self, name, button)
             row.addWidget(button)
-        layout.addLayout(row)
+        check = _button("检查路径", "check_targets", lambda: self._check_targets(report=True))
+        row.addWidget(check)
+        self.delete_button.setProperty("role", "danger")
+        manager_layout.addLayout(row)
+        manager_layout.addWidget(label("删除入口仅移除快捷方式。", "muted"))
         self.status_label = _label()
         self.status_label.setObjectName("status_label")
         layout.addWidget(self.status_label)
@@ -377,7 +634,10 @@ class ShortcutsPage(QWidget):
             # Periodic refresh must not open modal warnings or discard drafts.
             self.status_label.setText(f"无法读取快捷入口：{error}")
             return
+        if shortcuts == self._shortcuts:
+            return
         self._shortcuts = shortcuts
+        self._check_targets()
         blocker = QSignalBlocker(self.table)
         self.table.setRowCount(len(shortcuts))
         self.table.clearSelection()
@@ -396,7 +656,113 @@ class ShortcutsPage(QWidget):
         if restore_row >= 0:
             self.table.selectRow(restore_row)
         del blocker
+        self._show_target_status()
         self._selection_changed()
+
+    def _open_add_dialog(self):
+        self.add_dialog.show()
+        self.name_input.setFocus()
+
+    def eventFilter(self, watched, event):
+        if watched is self.grid.viewport() and event.type() in (QEvent.Leave, QEvent.Hide, QEvent.Resize):
+            self.hover_more.hide()
+        return super().eventFilter(watched, event)
+
+    def _show_tile_menu(self, item):
+        if item.data(Qt.UserRole) is None:
+            self.hover_more.hide()
+            return
+        rect = self.grid.visualItemRect(item)
+        self.hover_more.move(rect.right() - self.hover_more.width() - 3, rect.top() + 4)
+        self.hover_more.show()
+        self.hover_more.raise_()
+
+    def _check_targets(self, report=False):
+        errors = {}
+        local_icons = {}
+        check = getattr(self.controller, "check_shortcut", None)
+        if check:
+            for item in self._shortcuts:
+                try:
+                    target = check(item["id"])
+                except (ValueError, OSError) as error:
+                    errors[item["id"]] = str(error)
+                else:
+                    if item["kind"] != "web":
+                        local_icons[item["id"]] = self._system_icons.icon(QFileInfo(target))
+        self._target_errors = errors
+        self._target_icons = local_icons
+        self._populate_grid()
+        if report:
+            self._show_target_status()
+            self.status_label.setText(f"已检查 {len(self._shortcuts)} 个入口，{len(errors)} 个失效。"
+                                      if errors else f"已检查 {len(self._shortcuts)} 个入口。")
+
+    def _show_target_status(self):
+        for row, shortcut in enumerate(self._shortcuts):
+            item = self.table.item(row, 2)
+            error = self._target_errors.get(shortcut["id"])
+            item.setText(("失效 · " if error else "") + shortcut["target"])
+            item.setToolTip(error or shortcut["target"])
+
+    def _populate_grid(self):
+        selected = self.grid.currentItem()
+        identifier = selected.data(Qt.UserRole) if selected else None
+        self.hover_more.hide()
+        self.grid.clear()
+        for shortcut in self._shortcuts:
+            error = self._target_errors.get(shortcut["id"])
+            tile = QListWidgetItem(("失效 · " if error else "") + shortcut["name"], self.grid)
+            tile.setSizeHint(QSize(124, 82))
+            tile.setData(Qt.UserRole, shortcut["id"])
+            tile.setData(Qt.UserRole + 1, shortcut["kind"])
+            tile.setToolTip(f"{shortcut['name']}\n{error or shortcut['target']}")
+            if identifier == shortcut["id"]:
+                self.grid.setCurrentItem(tile)
+        tile = QListWidgetItem("添加入口", self.grid)
+        tile.setSizeHint(QSize(124, 82))
+        tile.setData(Qt.UserRole + 1, "add")
+        self.update_icons()
+
+    def update_icons(self):
+        t = colors(self.window())
+        for row in range(self.grid.count()):
+            item = self.grid.item(row)
+            identifier = item.data(Qt.UserRole)
+            system_icon = self._target_icons.get(identifier)
+            if system_icon and not system_icon.isNull():
+                item.setIcon(system_icon)
+            else:
+                tint = t["rose"] if identifier in self._target_errors else t["accent"]
+                item.setIcon(icon(item.data(Qt.UserRole + 1), tint, 29))
+
+    def _activate_tile(self, item):
+        if item is None:
+            return
+        identifier = item.data(Qt.UserRole)
+        if identifier is None:
+            self._open_add_dialog()
+            return
+        self.table.selectRow(self.grid.row(item))
+        if identifier in self._target_errors:
+            self._edit()
+        else:
+            self._open()
+
+    def _grid_menu(self, point):
+        item = self.grid.itemAt(point)
+        if item is None or item.data(Qt.UserRole) is None:
+            return
+        self.grid.setCurrentItem(item)
+        self.table.selectRow(self.grid.row(item))
+        menu = QMenu(self.grid)
+        for button in (self.open_button, self.edit_button, self.up_button, self.down_button, self.delete_button):
+            action = menu.addAction(button.text(), button.click)
+            if button is self.edit_button and item.data(Qt.UserRole) in self._target_errors:
+                action.setText("修复入口…")
+            action.setEnabled(button.isEnabled())
+        menu.exec(self.grid.viewport().mapToGlobal(point))
+        menu.deleteLater()
 
     def _selection_changed(self):
         selected = self._selected() is not None
@@ -426,6 +792,7 @@ class ShortcutsPage(QWidget):
             self.name_input.clear()
             self.target_input.clear()
             self.status_label.setText("快捷入口已添加。")
+            self.add_dialog.accept()
 
     def _open(self):
         shortcut = self._selected()
@@ -435,6 +802,9 @@ class ShortcutsPage(QWidget):
         if success:
             self.status_label.setText(str(result.get("message", "已打开快捷入口。"))
                                       if isinstance(result, dict) else "已打开快捷入口。")
+        elif hasattr(self.controller, "check_shortcut"):
+            self._check_targets()
+            self._show_target_status()
 
     def _edit(self):
         shortcut = self._selected()

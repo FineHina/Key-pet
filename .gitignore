@@ -1,13 +1,29 @@
 # 运行时用户数据（计时、提醒、快捷工具等本地记录）
-data/
+/data/
+/config.json
+/.config-*.tmp
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.log
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
 
 # Python
 __pycache__/
 *.py[cod]
+.venv/
 
 # 调试 / QA 临时产物
 assets/raw/_debug_*.png
 assets/raw/_qa_*.png
+assets/previews/qa_idle.png
+/*.zip
 
 # IDE / 系统
 .idea/

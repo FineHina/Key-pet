@@ -4,7 +4,6 @@ from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from .expressions import Expressions, LABELS
-from .scene import PET_H, PET_W
 
 
 def card_position(pet_rect, available, card_size, gap=12):
@@ -45,25 +44,10 @@ class ReactionCard(QWidget):
         scene = getattr(self.pet, "scene", None)
         if scene is None:
             return self.pet.frameGeometry()
-        ox, oy = scene.pet_origin(scale)
-        current = scene.current_animation_frame(now, self.pet.state)
-        if current is not None:
-            sources = ((current[1], scene._authored_transform(self.pet.state, scale)),)
-        else:
-            transforms = scene.transforms(now, self.pet.state, scale)
-            sources = tuple((alpha, transforms[name]) for name, alpha in scene._layer_alpha.items())
-        bounds = QRectF()
-        for alpha, transform in sources:
-            ys, xs = (alpha > 10).nonzero()
-            if not len(xs):
-                continue
-            rect = QRectF(ox + int(xs.min()) * scale, oy + int(ys.min()) * scale,
-                          (int(xs.max()) - int(xs.min()) + 1) * scale,
-                          (int(ys.max()) - int(ys.min()) + 1) * scale)
-            mapped = transform.mapRect(rect)
-            bounds = mapped if bounds.isNull() else bounds.united(mapped)
-        if bounds.isNull():
-            bounds = QRectF(ox, oy, PET_W * scale, PET_H * scale)
+        frame = getattr(self.pet, "displayed_character_frame", None)
+        if frame is None:
+            frame = scene.sample(now, self.pet.state, scale)
+        bounds = frame.bounds()
         origin = self.pet.mapToGlobal(QPoint())
         bounds.translate(origin.x(), origin.y())
         return bounds.toAlignedRect()

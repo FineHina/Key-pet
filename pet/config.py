@@ -30,6 +30,7 @@ DEFAULTS = {
     "fullscreen_dnd": False,
     "focus_minutes": 25,
     "break_minutes": 5,
+    "assistant_theme": "system",
 }
 
 _BOOLEAN_KEYS = {
@@ -68,6 +69,8 @@ def validate(settings):
     for key in ("quiet_start", "quiet_end"):
         if not isinstance(cfg[key], str) or not _TIME_PATTERN.fullmatch(cfg[key]):
             raise ValueError(f"{key} must use HH:MM (00:00 through 23:59)")
+    if cfg["assistant_theme"] not in ("light", "dark", "system"):
+        raise ValueError("assistant_theme must be light, dark or system")
     birthday = cfg["birthday_mmdd"]
     if not isinstance(birthday, str):
         raise ValueError("生日应为空或使用MM-DD格式。")

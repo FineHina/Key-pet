@@ -169,7 +169,7 @@ class DialoguePageTests(PageTests):
         self.page.input.setText("  你好  ")
         self.page.send_button.click()
         self.assertEqual(self.controller.calls, [("chat", "你好")])
-        self.assertEqual(self.page.history.toPlainText(), "你：你好\n凯伊：本地回应：你好")
+        self.assertEqual(self.page.history.toPlainText(), "你好\n本地回应：你好")
         self.assertEqual(self.page.input.text(), "")
         self.page.input.setText("回车发送")
         QTest.keyClick(self.page.input, Qt.Key_Return)
@@ -199,7 +199,7 @@ class DialoguePageTests(PageTests):
         for topic, title in TOPICS:
             self.page.topic_buttons[topic].click()
             self.assertEqual(self.controller.calls[-1], ("dialogue_topic", topic))
-            self.assertIn("你：话题：" + title, self.page.history.toPlainText())
+            self.assertIn("话题：" + title, self.page.history.toPlainText())
             self.assertEqual(self.page.topic_buttons[topic].property("topic_id"), topic)
             self.assertEqual(self.page.input.text(), "尚未发送")
         self.assertEqual(len(self.page.history.toPlainText().splitlines()), 16)
@@ -211,7 +211,7 @@ class DialoguePageTests(PageTests):
         self.page.input.setText("<i>你好</i>")
         self.page.send_button.click()
         self.assertEqual(self.page.history.toPlainText(),
-                         "你：<i>你好</i>\n凯伊：<b>不是 HTML</b> 第二行 第三行")
+                         "<i>你好</i>\n<b>不是 HTML</b> 第二行 第三行")
         self.assertIn("语音忙", self.page.status_label.text())
         self.controller.reaction = {"text": "仅文字", "waitnotice": "稍后再试"}
         self.page.topic_buttons["support"].click()
@@ -237,9 +237,9 @@ class DialoguePageTests(PageTests):
             self.page.send_button.click()
         lines = self.page.history.toPlainText().splitlines()
         self.assertEqual(len(lines), 60)
-        self.assertEqual(lines[0], "你：消息 7")
-        self.assertEqual(lines[-2], "你：消息 36")
-        self.assertEqual(lines[-1], "凯伊：第一行 第二行 第三行")
+        self.assertEqual(lines[0], "消息 7")
+        self.assertEqual(lines[-2], "消息 36")
+        self.assertEqual(lines[-1], "第一行 第二行 第三行")
         self.assertEqual(len(self.page._history), 30)
 
     def test_history_text_and_input_are_bounded(self):
@@ -248,14 +248,17 @@ class DialoguePageTests(PageTests):
         self.assertEqual(len(self.page.input.text()), 500)
         self.page.send_button.click()
         lines = self.page.history.toPlainText().splitlines()
-        self.assertEqual(len(lines[0]), len("你：") + 500)
-        self.assertEqual(len(lines[1]), len("凯伊：") + 4000)
+        self.assertEqual(len(lines[0]), 500)
+        self.assertEqual(len(lines[1]), 4000)
 
     def test_clear_is_local_and_keeps_unsent_drafts(self):
         self.page.topic_buttons["greeting"].click()
         self.page.input.setText("未发送")
         self.page.birthday_input.setText("12-31")
         calls = list(self.controller.calls)
+        self.page.clear_button.click()
+        self.assertTrue(self.page.history.toPlainText())
+        self.question.return_value = QMessageBox.Yes
         self.page.clear_button.click()
         self.assertEqual(self.page.history.toPlainText(), "")
         self.assertEqual(list(self.page._history), [])
@@ -330,7 +333,7 @@ class DialoguePageTests(PageTests):
         self.page.event_button.click()
         self.assertEqual(self.controller.calls, [("trigger_today_event",)])
         self.assertEqual(self.page.input.text(), "日历之外的草稿")
-        self.assertIn("凯伊：生日快乐！", self.page.history.toPlainText())
+        self.assertIn("生日快乐！", self.page.history.toPlainText())
         self.controller.event = None
         self.controller.changed.emit()
         self.assertFalse(self.page.event_button.isEnabled())

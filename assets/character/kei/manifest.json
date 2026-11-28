@@ -1,0 +1,270 @@
+{
+  "assets": {
+    "avatar_default": {
+      "path": "kei_avatar_default.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "avatar",
+        "complete",
+        "chat",
+        "archive"
+      ]
+    },
+    "chibi_default": {
+      "path": "kei_chibi_default.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "success",
+        "workbench"
+      ]
+    },
+    "chibi_happy": {
+      "path": "kei_chibi_happy.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "success"
+      ]
+    },
+    "chibi_sleepy": {
+      "path": "kei_chibi_sleepy.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "rest",
+        "sleepy"
+      ]
+    },
+    "dialogue_idle": {
+      "path": "kei_dialogue_idle.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1536
+      ],
+      "alpha": true,
+      "states": [
+        "chat"
+      ]
+    },
+    "dnd_quiet": {
+      "path": "kei_dnd_quiet.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "quiet"
+      ]
+    },
+    "error_soft": {
+      "path": "kei_error_soft.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "error"
+      ]
+    },
+    "expression_happy": {
+      "path": "kei_expression_happy.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "complete"
+      ]
+    },
+    "expression_neutral": {
+      "path": "kei_expression_neutral.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "avatar",
+        "ready",
+        "paused"
+      ]
+    },
+    "expression_rest": {
+      "path": "kei_expression_rest.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "paused",
+        "rest",
+        "quiet",
+        "sleepy"
+      ]
+    },
+    "expression_thinking": {
+      "path": "kei_expression_thinking.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "focus",
+        "reminder",
+        "error"
+      ]
+    },
+    "focus_active": {
+      "path": "kei_focus_active.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "focus"
+      ]
+    },
+    "focus_complete": {
+      "path": "kei_focus_complete.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "complete"
+      ]
+    },
+    "reminder_notice": {
+      "path": "kei_reminder_notice.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "reminder"
+      ]
+    },
+    "sound_archive": {
+      "path": "kei_sound_archive.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1024
+      ],
+      "alpha": true,
+      "states": [
+        "archive"
+      ]
+    },
+    "stand_default": {
+      "path": "kei_stand_default.png",
+      "provider": "用户自制并提供",
+      "size": [
+        1024,
+        1536
+      ],
+      "alpha": true,
+      "states": [
+        "ready",
+        "chat",
+        "workbench"
+      ]
+    }
+  },
+  "fallbacks": {
+    "avatar": [
+      "avatar_default",
+      "expression_neutral"
+    ],
+    "ready": [
+      "expression_neutral",
+      "stand_default"
+    ],
+    "focus": [
+      "focus_active",
+      "expression_thinking"
+    ],
+    "paused": [
+      "expression_rest",
+      "expression_neutral"
+    ],
+    "rest": [
+      "expression_rest",
+      "chibi_sleepy"
+    ],
+    "complete": [
+      "focus_complete",
+      "expression_happy",
+      "avatar_default"
+    ],
+    "reminder": [
+      "reminder_notice",
+      "expression_thinking"
+    ],
+    "chat": [
+      "dialogue_idle",
+      "stand_default",
+      "avatar_default"
+    ],
+    "archive": [
+      "sound_archive",
+      "avatar_default"
+    ],
+    "error": [
+      "error_soft",
+      "expression_thinking"
+    ],
+    "quiet": [
+      "dnd_quiet",
+      "expression_rest"
+    ],
+    "success": [
+      "chibi_happy",
+      "chibi_default"
+    ],
+    "sleepy": [
+      "chibi_sleepy",
+      "expression_rest"
+    ],
+    "workbench": [
+      "chibi_default",
+      "stand_default"
+    ]
+  }
+}
